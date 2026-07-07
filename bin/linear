@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Resolve to the real directory of this script, following symlinks
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+# For `take`, run the CLI, parse the prepared path, cd there, and open an interactive shell
+if [[ "${1-}" == "take" ]]; then
+  out="$("$SCRIPT_DIR/linear-cli.js" "$@" 2>&1)" || true
+  printf '%s\n' "$out"
+  dest="$(printf '%s\n' "$out" | sed -nE 's/^Prepared (.+)$/\1/p')"
+  if [ -z "$dest" ]; then
+    dest="$(printf '%s\n' "$out" | sed -nE 's/^Already prepared at (.+)$/\1/p')"
+  fi
+  if [ -n "$dest" ] && [ -d "$dest" ]; then
+    cd "$dest"
+    exec "${SHELL:-bash}" -i
+  fi
+  exit 0
+fi
+
+exec "$SCRIPT_DIR/linear-cli.js" "$@"
