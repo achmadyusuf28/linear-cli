@@ -9,9 +9,11 @@ while [ -L "$SOURCE" ]; do
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
-# For `take`, run the CLI, parse the prepared path, cd there, and open an interactive shell
-if [[ "${1-}" == "take" ]]; then
-  out="$("$SCRIPT_DIR/linear-cli.js" "$@" 2>&1)" || true
+# For commands that can pull an issue locally (take, create --take, or picking from mine/search),
+# run the CLI, parse the prepared path, cd there, and open an interactive shell
+if [[ "${1-}" =~ ^(take|create|mine|search)$ ]]; then
+  status=0
+  out="$("$SCRIPT_DIR/linear-cli.js" "$@" 2>&1)" || status=$?
   printf '%s\n' "$out"
   dest="$(printf '%s\n' "$out" | sed -nE 's/^Prepared (.+)$/\1/p')"
   if [ -z "$dest" ]; then
@@ -21,7 +23,7 @@ if [[ "${1-}" == "take" ]]; then
     cd "$dest"
     exec "${SHELL:-bash}" -i
   fi
-  exit 0
+  exit "$status"
 fi
 
 exec "$SCRIPT_DIR/linear-cli.js" "$@"

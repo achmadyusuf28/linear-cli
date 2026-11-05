@@ -1,19 +1,25 @@
 {
   "name": "linear-cli",
-  "version": "0.1.0",
-  "description": "CLI to work with Linear issues locally — pull issues, download attachments, manage comments",
+  "version": "0.2.0",
+  "description": "CLI to work with Linear issues locally \u2014 pull issues, download attachments, manage comments",
   "license": "MIT",
   "bin": {
     "linear-cli": "bin/linear"
   },
   "scripts": {
-    "start": "node bin/linear-cli.js"
+    "start": "node bin/linear-cli.js",
+    "test": "node test/cli.test.js"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/achmadyusuf28/linear-cli.git"
   },
-  "keywords": ["linear", "cli", "linear-app", "issues"],
+  "keywords": [
+    "linear",
+    "cli",
+    "linear-app",
+    "issues"
+  ],
   "engines": {
     "node": ">=14"
   }

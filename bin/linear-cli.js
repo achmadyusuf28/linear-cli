@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const https = require('https');
+const http = require('http');
 const { spawnSync } = require('child_process');
 
 const CONFIG_DIR = path.join(os.homedir(), '.config', 'linear-cli');
@@ -37,26 +38,36 @@ function authHeader(token) {
   return token; // Personal API key uses Authorization: <API_KEY>
 }
 
+// LINEAR_API_URL lets tests (or self-hosted proxies) point the CLI at another endpoint.
+const API_URL = process.env.LINEAR_API_URL || 'https://api.linear.app/graphql';
+
 function graphqlRequest(token, query, variables = {}) {
   const data = JSON.stringify({ query, variables });
   const headers = {
     'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(data),
     'Authorization': authHeader(token),
     'public-file-urls-expire-in': '300',
   };
+  const transport = API_URL.startsWith('http://') ? http : https;
   return new Promise((resolve, reject) => {
-    const req = https.request('https://api.linear.app/graphql', { method: 'POST', headers }, (res) => {
+    const req = transport.request(API_URL, { method: 'POST', headers }, (res) => {
       let body = '';
       res.setEncoding('utf8');
       res.on('data', (chunk) => (body += chunk));
       res.on('end', () => {
+        let json;
         try {
-          const json = JSON.parse(body || '{}');
-          if (json.errors) return reject(new Error('GraphQL error: ' + JSON.stringify(json.errors)));
-          resolve(json.data);
+          json = JSON.parse(body || '{}');
         } catch (e) {
-          reject(e);
+          return reject(new Error(`Linear API returned HTTP ${res.statusCode} with a non-JSON body`));
         }
+        if (json.errors) {
+          const msgs = json.errors.map(e => e.message).filter(Boolean).join('; ');
+          return reject(new Error('GraphQL error: ' + (msgs || JSON.stringify(json.errors))));
+        }
+        if (res.statusCode >= 400) return reject(new Error(`Linear API returned HTTP ${res.statusCode}`));
+        resolve(json.data);
       });
     });
     req.on('error', reject);
@@ -102,9 +113,21 @@ async function cmdMe(token) {
   console.log(`${v.name} <${v.email}> (${v.id})`);
 }
 
+const ISSUE_FIELDS = `id identifier title description url priority priorityLabel createdAt updatedAt
+  state { id name type } team { id key name } labels { nodes { name } }
+  assignee { id name } creator { id name }
+  parent { id identifier title state { name } }
+  children(first: 100) { nodes { id identifier title state { name } } }
+  project { id name url state } projectMilestone { name } cycle { number name }
+  relations(first: 50) { nodes { type relatedIssue { identifier title state { name } } } }
+  inverseRelations(first: 50) { nodes { type issue { identifier title state { name } } } }
+  attachments { nodes { id url title subtitle } }
+  comments(first: 50) { nodes { id body createdAt user { id name } } pageInfo { hasNextPage endCursor } }`;
+
 async function fetchIssue(token, issueCode) {
-  const q = `query Issue($id: String!) { issue(id: $id) { id identifier title description createdAt updatedAt assignee { id name } creator { id name } attachments { nodes { id url title subtitle } } comments(first: 50) { nodes { id body createdAt user { id name } } pageInfo { hasNextPage endCursor } } } }`;
+  const q = `query Issue($id: String!) { issue(id: $id) { ${ISSUE_FIELDS} } }`;
   const data = await graphqlRequest(token, q, { id: issueCode });
+  if (!data || !data.issue) throw new Error(`Issue ${issueCode} not found`);
   return data.issue;
 }
 
@@ -129,6 +152,108 @@ function extractIssueCode(input) {
   return null;
 }
 
+function briefIssue(i) {
+  return { identifier: i.identifier, title: i.title, state: i.state?.name || null };
+}
+
+// Linear stores a relation once, on the issue that "owns" it. Outgoing relations are read as-is;
+// incoming ones are flipped (blocks → blocked by, duplicate → duplicated by).
+const RELATION_LABELS = {
+  out: { blocks: 'blocks', duplicate: 'duplicate of', related: 'related to', similar: 'similar to' },
+  in: { blocks: 'blocked by', duplicate: 'duplicated by', related: 'related to', similar: 'similar to' },
+};
+
+function collectRelations(issue) {
+  const rels = [];
+  for (const r of issue.relations?.nodes || []) {
+    if (r.relatedIssue) rels.push({ type: RELATION_LABELS.out[r.type] || r.type, ...briefIssue(r.relatedIssue) });
+  }
+  for (const r of issue.inverseRelations?.nodes || []) {
+    if (r.issue) rels.push({ type: RELATION_LABELS.in[r.type] || r.type, ...briefIssue(r.issue) });
+  }
+  return rels;
+}
+
+function cycleLabel(c) {
+  return c ? (c.name ? `${c.name} (#${c.number})` : `Cycle ${c.number}`) : null;
+}
+
+function buildMetadata(issue) {
+  return {
+    id: issue.id,
+    identifier: issue.identifier,
+    title: issue.title,
+    url: issue.url || null,
+    state: issue.state ? { id: issue.state.id, name: issue.state.name, type: issue.state.type } : null,
+    priority: issue.priority ?? null,
+    priorityLabel: issue.priorityLabel || null,
+    team: issue.team ? { id: issue.team.id, key: issue.team.key, name: issue.team.name } : null,
+    labels: (issue.labels?.nodes || []).map(l => l.name),
+    creator: issue.creator || null,
+    assignee: issue.assignee || null,
+    parent: issue.parent ? briefIssue(issue.parent) : null,
+    children: (issue.children?.nodes || []).map(briefIssue),
+    project: issue.project ? { id: issue.project.id, name: issue.project.name, url: issue.project.url, milestone: issue.projectMilestone?.name || null } : null,
+    cycle: issue.cycle ? { number: issue.cycle.number, name: issue.cycle.name || null } : null,
+    relations: collectRelations(issue),
+    timestamps: { createdAt: issue.createdAt, updatedAt: issue.updatedAt },
+    attachments: (issue.attachments?.nodes) || [],
+  };
+}
+
+function renderComments(issue, index) {
+  return (issue.comments?.nodes || [])
+    .map(c => `- ${c.user?.name || 'Unknown'} at ${c.createdAt}:\n\n${rewriteMarkdownAttachments(c.body || '', index)}\n`)
+    .join('\n');
+}
+
+// Writes metadata.json, description.md, comments.md and downloads attachments.
+// Shared by take, sync and comments so every command produces the same folder layout.
+async function writeIssueFolder(token, issue, folder) {
+  ensureDir(folder);
+  const metadata = buildMetadata(issue);
+  writeFileSafe(path.join(folder, 'metadata.json'), JSON.stringify(metadata, null, 2));
+
+  const attachmentsDir = path.join(folder, 'attachments');
+  ensureDir(attachmentsDir);
+  const indexPath = path.join(attachmentsDir, 'index.csv');
+  const index = loadIndex(indexPath);
+  const attPromises = metadata.attachments.map(att =>
+    downloadIfLinearAsset(token, att.url, attachmentsDir, undefined, index, indexPath)
+  );
+  const refPromises = parseUploadRefs(issue.description || '').map(ref =>
+    downloadIfLinearAsset(token, ref.url, attachmentsDir, ref.name, index, indexPath)
+  );
+  const commentRefPromises = (issue.comments?.nodes || []).flatMap(c =>
+    parseUploadRefs(c.body || '').map(ref =>
+      downloadIfLinearAsset(token, ref.url, attachmentsDir, ref.name, index, indexPath, 'comments')
+    )
+  );
+  await Promise.all([...attPromises, ...refPromises, ...commentRefPromises].map(p => p.catch(() => {})));
+
+  const header = [
+    `Creator: ${issue.creator?.name || 'Unknown'}`,
+    `Assignee: ${issue.assignee?.name || 'Unassigned'}`,
+    `Identifier: ${issue.identifier}`,
+    issue.state ? `State: ${issue.state.name}` : null,
+    issue.priorityLabel ? `Priority: ${issue.priorityLabel}` : null,
+    metadata.labels.length ? `Labels: ${metadata.labels.join(', ')}` : null,
+    metadata.project ? `Project: ${metadata.project.name}${metadata.project.milestone ? ` / ${metadata.project.milestone}` : ''}` : null,
+    metadata.cycle ? `Cycle: ${cycleLabel(metadata.cycle)}` : null,
+    metadata.parent ? `Parent: ${metadata.parent.identifier} ${metadata.parent.title}` : null,
+    metadata.children.length ? `Sub-issues: ${metadata.children.map(c => c.identifier).join(', ')}` : null,
+    issue.url ? `URL: ${issue.url}` : null,
+  ].filter(Boolean).join('\n');
+  const baseMd = `# ${issue.title}\n\n${header}\n\n---\n\n${issue.description || ''}\n`;
+  writeFileSafe(path.join(folder, 'description.md'), rewriteMarkdownAttachments(baseMd, index));
+  writeFileSafe(path.join(folder, 'comments.md'), renderComments(issue, index) || '');
+  return { metadata, index };
+}
+
+async function fetchViewer(token) {
+  return (await graphqlRequest(token, `query { viewer { id name email } }`)).viewer;
+}
+
 async function cmdTake(token, argv) {
   let meFlag = false;
   let issueArg = null;
@@ -147,56 +272,15 @@ async function cmdTake(token, argv) {
     console.log(`Already prepared at ${existingPath}`);
     return;
   }
-  let viewer = null;
   if (meFlag) {
-    viewer = (await graphqlRequest(token, `query { viewer { id name } }`)).viewer;
+    const viewer = await fetchViewer(token);
+    await assignMe(token, issueCode, viewer.id).catch((e) => {
+      console.error(`Warning: could not assign ${issueCode} to you: ${e.message}`);
+    });
   }
   const issue = await fetchIssue(token, issueCode);
-  if (meFlag && viewer) {
-    await assignMe(token, issueCode, viewer.id).catch(() => {});
-  }
-
-  const folder = path.join(ROOT_DIR, dateStamp(), issueCode);
-  ensureDir(folder);
-
-  const assigneeName = (issue.assignee?.name) || (viewer?.name) || 'Unassigned';
-  const baseMd = `# ${issue.title}\n\nCreator: ${issue.creator?.name || 'Unknown'}\nAssignee: ${assigneeName}\nIdentifier: ${issue.identifier}\n\n---\n\n${issue.description || ''}\n`;
-
-  const metadata = {
-    id: issue.id,
-    identifier: issue.identifier,
-    title: issue.title,
-    creator: issue.creator,
-    assignee: issue.assignee || (viewer ? { id: viewer.id, name: viewer.name } : null),
-    timestamps: { createdAt: issue.createdAt, updatedAt: issue.updatedAt },
-    attachments: (issue.attachments?.nodes) || [],
-  };
-  writeFileSafe(path.join(folder, 'metadata.json'), JSON.stringify(metadata, null, 2));
-
-  const attachmentsDir = path.join(folder, 'attachments');
-  ensureDir(attachmentsDir);
-  const indexPath = path.join(attachmentsDir, 'index.csv');
-  const index = loadIndex(indexPath);
-  // Download attachments and referenced uploads concurrently
-  const attPromises = (metadata.attachments || []).map(att =>
-    downloadIfLinearAsset(token, att.url, attachmentsDir, undefined, index, indexPath)
-  );
-  const refPromises = parseUploadRefs(issue.description || '').map(ref =>
-    downloadIfLinearAsset(token, ref.url, attachmentsDir, ref.name, index, indexPath)
-  );
-  const commentRefPromises = (issue.comments?.nodes || []).flatMap(c =>
-    parseUploadRefs(c.body || '').map(ref =>
-      downloadIfLinearAsset(token, ref.url, attachmentsDir, ref.name, index, indexPath, 'comments')
-    )
-  );
-  await Promise.all([...attPromises, ...refPromises, ...commentRefPromises].map(p => p.catch(() => {})));
-
-  // Rewrite description links to local attachments and save
-  const finalMd = rewriteMarkdownAttachments(baseMd, index);
-  writeFileSafe(path.join(folder, 'description.md'), finalMd);
-
-  const commentsMd = (issue.comments?.nodes || []).map(c => `- ${c.user?.name || 'Unknown'} at ${c.createdAt}:\n\n${rewriteMarkdownAttachments(c.body || '', index)}\n`).join('\n');
-  writeFileSafe(path.join(folder, 'comments.md'), commentsMd || '');
+  const folder = path.join(ROOT_DIR, dateStamp(), issue.identifier || issueCode);
+  await writeIssueFolder(token, issue, folder);
   console.log(`Prepared ${folder}`);
 }
 
@@ -388,8 +472,7 @@ async function createIssueAttachment(token, issueId, url, title) {
 
 async function cmdComments(token, argv) {
   const { issueArg, addBody, files } = parseCommentArgs(argv);
-  let issueCode = extractIssueCode(issueArg);
-  if (!issueCode) issueCode = detectIssueCodeFromCwd();
+  const issueCode = resolveIssueCode(issueArg);
   if (!issueCode) {
     console.error('Usage: linear-cli comments <ISSUE_CODE|FULL_URL> [-m "comment"] [-f <file>] (or run inside issue directory)');
     process.exit(1);
@@ -418,69 +501,23 @@ async function cmdComments(token, argv) {
 
   const latest = await fetchIssue(token, issueCode);
   const folder = findExistingIssuePath(issueCode) || path.join(ROOT_DIR, dateStamp(), issueCode);
-  ensureDir(folder);
-  const attachmentsDir = path.join(folder, 'attachments');
-  ensureDir(attachmentsDir);
-  const indexPath = path.join(attachmentsDir, 'index.csv');
-  const index = loadIndex(indexPath);
-  const attPromises2 = (latest.attachments?.nodes || []).map(att =>
-    downloadIfLinearAsset(token, att.url, attachmentsDir, undefined, index, indexPath)
-  );
-  const refPromises2 = (latest.comments?.nodes || []).flatMap(c =>
-    parseUploadRefs(c.body || '').map(ref =>
-      downloadIfLinearAsset(token, ref.url, attachmentsDir, ref.name, index, indexPath, 'comments')
-    )
-  );
-  await Promise.all([...attPromises2, ...refPromises2].map(p => p.catch(() => {})));
-  const commentsMd = (latest.comments?.nodes || []).map(c => `- ${c.user?.name || 'Unknown'} at ${c.createdAt}:\n\n${rewriteMarkdownAttachments(c.body || '', index)}\n`).join('\n');
-  writeFileSafe(path.join(folder, 'comments.md'), commentsMd || '');
-  const list = (latest.comments?.nodes || []).map(c => ({
-    id: c.id,
-    user: c.user?.name || 'Unknown',
-    createdAt: c.createdAt,
-    body: rewriteMarkdownAttachments(c.body || '', index),
-  }));
-  for (const c of list) {
-    console.log(`[${c.createdAt}] ${c.user}:`);
-    console.log(c.body);
+  const { index } = await writeIssueFolder(token, latest, folder);
+  for (const c of latest.comments?.nodes || []) {
+    console.log(`[${c.createdAt}] ${c.user?.name || 'Unknown'}:`);
+    console.log(rewriteMarkdownAttachments(c.body || '', index));
     console.log('---');
   }
 }
 
 async function cmdSync(token, argv) {
-  const rawArg = argv && argv[0];
-  let issueCode = extractIssueCode(rawArg);
-  if (!issueCode) issueCode = detectIssueCodeFromCwd();
+  const issueCode = resolveIssueCode(argv && argv.find(a => !a.startsWith('-')));
   if (!issueCode) {
     console.error('Usage: linear-cli sync <ISSUE_CODE|FULL_URL> (or run inside issue directory)');
     process.exit(1);
   }
-  const existingPath = findExistingIssuePath(issueCode);
-  const folder = existingPath || path.join(ROOT_DIR, dateStamp(), issueCode);
-  ensureDir(folder);
+  const folder = findExistingIssuePath(issueCode) || path.join(ROOT_DIR, dateStamp(), issueCode);
   const issue = await fetchIssue(token, issueCode);
-  const baseMd = `# ${issue.title}\n\n${issue.description || ''}\n`;
-  writeFileSafe(path.join(folder, 'metadata.json'), JSON.stringify({ id: issue.id, identifier: issue.identifier, title: issue.title, timestamps: { createdAt: issue.createdAt, updatedAt: issue.updatedAt } }, null, 2));
-  const attachmentsDir = path.join(folder, 'attachments');
-  ensureDir(attachmentsDir);
-  const indexPath = path.join(attachmentsDir, 'index.csv');
-  const index = loadIndex(indexPath);
-  const attPromises3 = (issue.attachments?.nodes || []).map(att =>
-    downloadIfLinearAsset(token, att.url, attachmentsDir, undefined, index, indexPath)
-  );
-  const refPromises3 = parseUploadRefs(issue.description || '').map(ref =>
-    downloadIfLinearAsset(token, ref.url, attachmentsDir, ref.name, index, indexPath)
-  );
-  const commentRefPromises3 = (issue.comments?.nodes || []).flatMap(c =>
-    parseUploadRefs(c.body || '').map(ref =>
-      downloadIfLinearAsset(token, ref.url, attachmentsDir, ref.name, index, indexPath, 'comments')
-    )
-  );
-  await Promise.all([...attPromises3, ...refPromises3, ...commentRefPromises3].map(p => p.catch(() => {})));
-  const finalMd = rewriteMarkdownAttachments(baseMd, index);
-  writeFileSafe(path.join(folder, 'description.md'), finalMd);
-  const commentsMd = (issue.comments?.nodes || []).map(c => `- ${c.user?.name || 'Unknown'} at ${c.createdAt}:\n\n${rewriteMarkdownAttachments(c.body || '', index)}\n`).join('\n');
-  writeFileSafe(path.join(folder, 'comments.md'), commentsMd || '');
+  await writeIssueFolder(token, issue, folder);
   console.log(`Synced ${folder}`);
 }
 
@@ -530,37 +567,468 @@ function findExistingIssuePath(code) {
 }
 
 function detectIssueCodeFromCwd() {
-  const cwd = process.cwd();
-  const m = /[A-Z]+-\d+/i.exec(cwd);
-  return m ? m[0] : null;
+  // Prefer metadata.json from the issue folder (works from attachments/ etc.),
+  // then fall back to a path segment that looks exactly like an issue code.
+  let dir = process.cwd();
+  for (let i = 0; i < 4; i++) {
+    try {
+      const meta = JSON.parse(fs.readFileSync(path.join(dir, 'metadata.json'), 'utf8'));
+      if (meta.identifier) return meta.identifier;
+    } catch {}
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  const segs = process.cwd().split(path.sep).reverse();
+  const seg = segs.find(s => /^[A-Z][A-Z0-9]*-\d+$/i.test(s));
+  return seg ? seg.toUpperCase() : null;
 }
+
+function looksLikeIssueRef(s) {
+  return /^[A-Z][A-Z0-9]*-\d+$/i.test(s) || s.includes('linear.app/');
+}
+
+function resolveIssueCode(arg) {
+  return extractIssueCode(arg) || detectIssueCodeFromCwd();
+}
+
+// Generic "flags + positionals" parser. `spec` maps flag names to true (takes a value) or false (boolean).
+function parseArgs(argv, spec) {
+  const flags = {};
+  const positionals = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (Object.prototype.hasOwnProperty.call(spec, a)) {
+      if (spec[a]) {
+        if (i + 1 >= argv.length) throw new Error(`Missing value for ${a}`);
+        flags[a] = argv[++i];
+      } else {
+        flags[a] = true;
+      }
+    } else if (a.startsWith('-') && a.length > 1) {
+      throw new Error(`Unknown option: ${a}`);
+    } else {
+      positionals.push(a);
+    }
+  }
+  return { flags, positionals };
+}
+
+function flag(flags, ...names) {
+  for (const n of names) if (flags[n] !== undefined) return flags[n];
+  return undefined;
+}
+
+// Case-insensitive match: exact, then prefix, then substring. Returns { match } or { candidates }.
+function pickMatch(items, query, keysOf) {
+  const q = query.trim().toLowerCase();
+  const tiers = [
+    (k) => k === q,
+    (k) => k.startsWith(q),
+    (k) => k.includes(q),
+  ];
+  for (const test of tiers) {
+    const hits = items.filter(it => keysOf(it).some(k => k && test(String(k).toLowerCase())));
+    if (hits.length === 1) return { match: hits[0] };
+    if (hits.length > 1) return { candidates: hits };
+  }
+  return { candidates: [] };
+}
+
+function fzfPick(lines) {
+  if (!process.stdin.isTTY || !hasFzf()) return null;
+  const proc = spawnSync('fzf', ['--no-sort'], { input: lines.join('\n'), encoding: 'utf8', stdio: ['pipe', 'pipe', 'inherit'] });
+  const out = (proc.stdout || '').trim();
+  return out || null;
+}
+
+function formatIssueLine(i) {
+  const state = i.state?.name ? `[${i.state.name}]` : '';
+  return `${i.identifier.padEnd(10)} ${state.padEnd(15)} ${i.title}`;
+}
+
+// Prints issue lines; with fzf in an interactive terminal, the picked issue is passed to `take`.
+async function listOrPick(token, issues, emptyMsg) {
+  if (issues.length === 0) {
+    console.log(emptyMsg);
+    return;
+  }
+  const lines = issues.map(formatIssueLine);
+  const picked = fzfPick(lines);
+  if (picked) {
+    const code = extractIssueCode(picked);
+    if (code) return cmdTake(token, [code]);
+    return;
+  }
+  console.log(lines.join('\n'));
+}
+
+async function findTeam(token, key) {
+  const q = `query { teams(first: 100) { nodes { id key name } } }`;
+  const teams = (await graphqlRequest(token, q)).teams.nodes;
+  if (!key) {
+    if (teams.length === 1) return teams[0];
+    throw new Error(`Multiple teams found; pass --team <KEY> (one of: ${teams.map(t => t.key).join(', ')})`);
+  }
+  const t = teams.find(t => t.key.toLowerCase() === key.toLowerCase());
+  if (!t) throw new Error(`Team ${key} not found (available: ${teams.map(t => t.key).join(', ')})`);
+  return t;
+}
+
+async function cmdMine(token, argv) {
+  const { flags } = parseArgs(argv, { '--all': false, '-a': false, '--team': true, '-t': true });
+  const filter = {};
+  if (!flag(flags, '--all', '-a')) filter.state = { type: { nin: ['completed', 'canceled'] } };
+  const team = flag(flags, '--team', '-t');
+  if (team) filter.team = { key: { eqIgnoreCase: team } };
+  const q = `query Mine($filter: IssueFilter) { viewer { assignedIssues(first: 100, filter: $filter, orderBy: updatedAt) { nodes { identifier title priorityLabel state { name type } team { key } } } } }`;
+  const data = await graphqlRequest(token, q, { filter });
+  await listOrPick(token, data.viewer.assignedIssues.nodes, 'No issues assigned to you.');
+}
+
+async function cmdSearch(token, argv) {
+  const { flags, positionals } = parseArgs(argv, { '--team': true, '-t': true, '--all': false, '-a': false });
+  const term = positionals.join(' ').trim();
+  if (!term) {
+    console.error('Usage: linear-cli search <text> [--team KEY] [--all]');
+    process.exit(1);
+  }
+  const filter = {};
+  const team = flag(flags, '--team', '-t');
+  if (team) filter.team = { key: { eqIgnoreCase: team } };
+  if (!flag(flags, '--all', '-a')) filter.state = { type: { nin: ['completed', 'canceled'] } };
+  const q = `query Search($term: String!, $filter: IssueFilter) { searchIssues(term: $term, first: 50, filter: $filter) { nodes { identifier title state { name type } team { key } } } }`;
+  const data = await graphqlRequest(token, q, { term, filter });
+  await listOrPick(token, data.searchIssues.nodes, `No issues match "${term}".`);
+}
+
+async function cmdShow(token, argv) {
+  const issueCode = resolveIssueCode(argv.find(a => !a.startsWith('-')));
+  if (!issueCode) {
+    console.error('Usage: linear-cli show <ISSUE_CODE|FULL_URL> (or run inside issue directory)');
+    process.exit(1);
+  }
+  const i = await fetchIssue(token, issueCode);
+  const labels = (i.labels?.nodes || []).map(l => l.name);
+  const rows = [
+    ['State', i.state?.name],
+    ['Priority', i.priorityLabel],
+    ['Assignee', i.assignee?.name || 'Unassigned'],
+    ['Creator', i.creator?.name],
+    ['Team', i.team ? `${i.team.name} (${i.team.key})` : null],
+    ['Labels', labels.length ? labels.join(', ') : null],
+    ['Project', i.project ? `${i.project.name}${i.projectMilestone ? ` / ${i.projectMilestone.name}` : ''}` : null],
+    ['Cycle', cycleLabel(i.cycle)],
+    ['Parent', i.parent ? `${i.parent.identifier} ${i.parent.title}` : null],
+    ['Sub-issues', (i.children?.nodes || []).length ? `${i.children.nodes.length} (${i.children.nodes.map(c => c.identifier).join(', ')})` : null],
+    ['Relations', collectRelations(i).map(r => `${r.type} ${r.identifier}`).join(', ') || null],
+    ['Updated', i.updatedAt],
+    ['URL', i.url],
+  ].filter(([, v]) => v);
+  console.log(`${i.identifier}: ${i.title}\n`);
+  for (const [k, v] of rows) console.log(`${(k + ':').padEnd(12)} ${v}`);
+  if (i.description) console.log(`\n${i.description}`);
+  if ((i.children?.nodes || []).length || i.parent) console.log('\nRun "linear-cli tree" to see the full hierarchy.');
+  const local = findExistingIssuePath(i.identifier);
+  if (local) console.log(`\nLocal copy: ${local}`);
+}
+
+function openUrl(url) {
+  const cmd = process.platform === 'darwin' ? ['open', [url]]
+    : process.platform === 'win32' ? ['cmd', ['/c', 'start', '', url]]
+    : ['xdg-open', [url]];
+  const r = spawnSync(cmd[0], cmd[1], { stdio: 'ignore' });
+  return r.status === 0;
+}
+
+async function cmdOpen(token, argv) {
+  const issueCode = resolveIssueCode(argv.find(a => !a.startsWith('-')));
+  if (!issueCode) {
+    console.error('Usage: linear-cli open <ISSUE_CODE|FULL_URL> (or run inside issue directory)');
+    process.exit(1);
+  }
+  // Use the stored URL when we have a local copy, to skip a network round trip.
+  let url = null;
+  const local = findExistingIssuePath(issueCode);
+  if (local) {
+    try { url = JSON.parse(fs.readFileSync(path.join(local, 'metadata.json'), 'utf8')).url || null; } catch {}
+  }
+  if (!url) {
+    const data = await graphqlRequest(token, `query($id: String!) { issue(id: $id) { url } }`, { id: issueCode });
+    if (!data.issue) throw new Error(`Issue ${issueCode} not found`);
+    url = data.issue.url;
+  }
+  console.log(url);
+  if (!openUrl(url)) console.error('Could not launch a browser; open the URL above manually.');
+}
+
+// Refreshes a local copy's metadata.json after a remote change, if one exists.
+async function refreshLocalMetadata(token, issueCode) {
+  const local = findExistingIssuePath(issueCode);
+  if (!local) return;
+  const issue = await fetchIssue(token, issueCode);
+  await writeIssueFolder(token, issue, local);
+}
+
+async function cmdStatus(token, argv) {
+  const { positionals } = parseArgs(argv, {});
+  // `status STATE` inside an issue dir, or `status ISSUE [STATE...]`
+  let issueArg = null;
+  let stateWords = positionals;
+  if (positionals.length && looksLikeIssueRef(positionals[0])) {
+    issueArg = positionals[0];
+    stateWords = positionals.slice(1);
+  }
+  const issueCode = resolveIssueCode(issueArg);
+  if (!issueCode) {
+    console.error('Usage: linear-cli status [ISSUE_CODE] [STATE] (or run inside issue directory)');
+    process.exit(1);
+  }
+  const q = `query($id: String!) { issue(id: $id) { id identifier state { id name type } team { states(first: 100) { nodes { id name type position } } } } }`;
+  const data = await graphqlRequest(token, q, { id: issueCode });
+  const issue = data.issue;
+  if (!issue) throw new Error(`Issue ${issueCode} not found`);
+  const states = issue.team.states.nodes.slice().sort((a, b) => a.position - b.position);
+  const wanted = stateWords.join(' ').trim();
+  if (!wanted) {
+    console.log(`${issue.identifier} is ${issue.state.name}\n\nAvailable states:`);
+    for (const st of states) console.log(`  ${st.id === issue.state.id ? '*' : ' '} ${st.name} (${st.type})`);
+    return;
+  }
+  const { match, candidates } = pickMatch(states, wanted, st => [st.name]);
+  if (!match) {
+    const names = (candidates.length ? candidates : states).map(st => st.name).join(', ');
+    throw new Error(candidates.length ? `"${wanted}" is ambiguous: ${names}` : `No state matches "${wanted}". Available: ${names}`);
+  }
+  if (match.id === issue.state.id) {
+    console.log(`${issue.identifier} is already ${match.name}`);
+    return;
+  }
+  const m = `mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success issue { state { name } } } }`;
+  const res = await graphqlRequest(token, m, { id: issue.id, input: { stateId: match.id } });
+  if (!res.issueUpdate.success) throw new Error('Linear rejected the state change');
+  console.log(`${issue.identifier}: ${issue.state.name} → ${res.issueUpdate.issue.state.name}`);
+  await refreshLocalMetadata(token, issue.identifier);
+}
+
+async function findUser(token, query) {
+  const filter = { or: [
+    { email: { eqIgnoreCase: query } },
+    { displayName: { containsIgnoreCase: query } },
+    { name: { containsIgnoreCase: query } },
+  ] };
+  const q = `query($filter: UserFilter) { users(first: 50, filter: $filter) { nodes { id name displayName email active } } }`;
+  const users = (await graphqlRequest(token, q, { filter })).users.nodes.filter(u => u.active !== false);
+  const { match, candidates } = pickMatch(users, query, u => [u.email, u.displayName, u.name]);
+  if (match) return match;
+  if (candidates.length) throw new Error(`"${query}" matches several users: ${candidates.map(u => `${u.name} <${u.email}>`).join(', ')}`);
+  throw new Error(`No user matches "${query}"`);
+}
+
+async function cmdAssign(token, argv) {
+  const { flags, positionals } = parseArgs(argv, { '-me': false, '--me': false, '--none': false });
+  let issueArg = null;
+  let who = positionals;
+  if (positionals.length && looksLikeIssueRef(positionals[0])) {
+    issueArg = positionals[0];
+    who = positionals.slice(1);
+  }
+  const issueCode = resolveIssueCode(issueArg);
+  const me = flag(flags, '-me', '--me');
+  const none = flag(flags, '--none');
+  const target = who.join(' ').trim();
+  if (!issueCode || [me, none, target].filter(Boolean).length !== 1) {
+    console.error('Usage: linear-cli assign [ISSUE_CODE] (-me | --none | <name|email>) (or run inside issue directory)');
+    process.exit(1);
+  }
+  let assignee = null;
+  if (me) assignee = await fetchViewer(token);
+  else if (target) assignee = await findUser(token, target);
+  const m = `mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success issue { identifier assignee { name } } } }`;
+  const res = await graphqlRequest(token, m, { id: issueCode, input: { assigneeId: assignee ? assignee.id : null } });
+  if (!res.issueUpdate.success) throw new Error('Linear rejected the assignment');
+  const i = res.issueUpdate.issue;
+  console.log(i.assignee ? `${i.identifier} assigned to ${i.assignee.name}` : `${i.identifier} unassigned`);
+  await refreshLocalMetadata(token, i.identifier);
+}
+
+async function cmdTeams(token) {
+  const teams = (await graphqlRequest(token, `query { teams(first: 100) { nodes { id key name } } }`)).teams.nodes;
+  if (!teams.length) return console.log('No teams found.');
+  for (const t of teams) console.log(`${t.key.padEnd(8)} ${t.name}`);
+}
+
+async function cmdCreate(token, argv) {
+  const { flags, positionals } = parseArgs(argv, {
+    '--team': true, '-t': true,
+    '-d': true, '--description': true,
+    '-f': true, '--file': true,
+    '-me': false, '--me': false,
+    '--take': false,
+  });
+  const title = positionals.join(' ').trim();
+  if (!title) {
+    console.error('Usage: linear-cli create [--team KEY] "Title" [-d "description" | -f file.md] [-me] [--take]');
+    process.exit(1);
+  }
+  const team = await findTeam(token, flag(flags, '--team', '-t'));
+  const input = { teamId: team.id, title };
+  const file = flag(flags, '-f', '--file');
+  const desc = flag(flags, '-d', '--description');
+  if (file) input.description = fs.readFileSync(file, 'utf8');
+  else if (desc) input.description = desc;
+  if (flag(flags, '-me', '--me')) input.assigneeId = (await fetchViewer(token)).id;
+  const m = `mutation($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier title url } } }`;
+  const res = await graphqlRequest(token, m, { input });
+  if (!res.issueCreate.success) throw new Error('Linear rejected the new issue');
+  const i = res.issueCreate.issue;
+  console.log(`Created ${i.identifier}: ${i.title}\n${i.url}`);
+  if (flag(flags, '--take')) await cmdTake(token, [i.identifier]);
+}
+
+// Builds a nested `children { ... }` selection `depth` levels deep.
+function childrenSelection(depth) {
+  if (depth <= 0) return '';
+  return `children(first: 100) { nodes { identifier title state { name } ${childrenSelection(depth - 1)} } }`;
+}
+
+function parentSelection(depth) {
+  if (depth <= 0) return '';
+  return `parent { identifier title state { name } ${parentSelection(depth - 1)} }`;
+}
+
+function stateTag(i) {
+  return i.state?.name ? ` [${i.state.name}]` : '';
+}
+
+function printChildren(nodes, prefix, out) {
+  nodes.forEach((c, idx) => {
+    const last = idx === nodes.length - 1;
+    out.push(`${prefix}${last ? '└── ' : '├── '}${c.identifier} ${c.title}${stateTag(c)}`);
+    const kids = c.children?.nodes || [];
+    if (kids.length) printChildren(kids, prefix + (last ? '    ' : '│   '), out);
+  });
+}
+
+async function cmdTree(token, argv) {
+  const { flags, positionals } = parseArgs(argv, { '--depth': true, '-d': true });
+  const depth = Math.max(1, Math.min(5, parseInt(flag(flags, '--depth', '-d') || '2', 10) || 2));
+  const issueCode = resolveIssueCode(positionals[0]);
+  if (!issueCode) {
+    console.error('Usage: linear-cli tree [ISSUE_CODE] [--depth N] (or run inside issue directory)');
+    process.exit(1);
+  }
+  const q = `query($id: String!) { issue(id: $id) {
+    identifier title state { name }
+    project { name url } projectMilestone { name } cycle { number name }
+    ${parentSelection(6)}
+    ${childrenSelection(depth)}
+    relations(first: 50) { nodes { type relatedIssue { identifier title state { name } } } }
+    inverseRelations(first: 50) { nodes { type issue { identifier title state { name } } } }
+  } }`;
+  const data = await graphqlRequest(token, q, { id: issueCode });
+  const issue = data.issue;
+  if (!issue) throw new Error(`Issue ${issueCode} not found`);
+
+  const out = [];
+  if (issue.project) out.push(`Project: ${issue.project.name}${issue.projectMilestone ? ` / ${issue.projectMilestone.name}` : ''}`);
+  if (issue.cycle) out.push(`Cycle:   ${cycleLabel(issue.cycle)}`);
+  if (out.length) out.push('');
+
+  // Ancestors, root first
+  const ancestors = [];
+  for (let p = issue.parent; p; p = p.parent) ancestors.unshift(p);
+  let indent = '';
+  for (const a of ancestors) {
+    out.push(`${indent}${a.identifier} ${a.title}${stateTag(a)}`);
+    indent += '  ';
+  }
+  out.push(`${indent}${ancestors.length ? '└ ' : ''}▶ ${issue.identifier} ${issue.title}${stateTag(issue)}`);
+  printChildren(issue.children?.nodes || [], indent + (ancestors.length ? '    ' : '  '), out);
+
+  const rels = collectRelations(issue);
+  if (rels.length) {
+    out.push('', 'Relations:');
+    const byType = {};
+    for (const r of rels) (byType[r.type] = byType[r.type] || []).push(r);
+    for (const [type, list] of Object.entries(byType)) {
+      for (const r of list) out.push(`  ${type.padEnd(14)} ${r.identifier} ${r.title}${r.state ? ` [${r.state}]` : ''}`);
+    }
+  }
+  console.log(out.join('\n'));
+}
+
+const HELP = `Usage: linear-cli <command> [args]
+
+Local workflow:
+  login <token> | login --env         Save your Linear API key
+  me                                  Show your user info
+  take [-me] <ISSUE>                  Pull an issue locally (optionally assign yourself)
+  sync [ISSUE]                        Refresh a locally stored issue
+  comments [ISSUE] [-m "text"] [-f file]
+                                      Read or post comments
+  list                                Browse local issues (fzf if available)
+
+Find & triage:
+  mine [--all] [--team KEY]           Issues assigned to you (pick with fzf to take)
+  search <text> [--team KEY] [--all]  Search issues (pick with fzf to take)
+  show [ISSUE]                        Print an issue summary
+  tree [ISSUE] [--depth N]            Show project, parent chain, sub-issues and relations
+  open [ISSUE]                        Open the issue in your browser
+  status [ISSUE] [STATE]              Show or change workflow state ("progress" → In Progress)
+  assign [ISSUE] (-me | --none | <name|email>)
+                                      Change the assignee
+  create [--team KEY] "Title" [-d text | -f file] [-me] [--take]
+                                      Create an issue
+  teams                               List teams and their keys
+
+ISSUE is a code (TEC-123) or URL; when omitted, it is taken from the current issue directory.`;
+
+const COMMANDS = {
+  me: (t) => cmdMe(t),
+  take: cmdTake,
+  comments: cmdComments,
+  sync: cmdSync,
+  list: () => cmdList(),
+  mine: cmdMine,
+  search: cmdSearch,
+  show: cmdShow,
+  tree: cmdTree,
+  open: cmdOpen,
+  status: cmdStatus,
+  assign: cmdAssign,
+  teams: (t) => cmdTeams(t),
+  create: cmdCreate,
+};
 
 async function main() {
   const [, , cmd, ...args] = process.argv;
   if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
-    console.log('Commands: login <token>|--env, me, take [-me] <ISSUE_CODE|FULL_URL>, comments <ISSUE_CODE|FULL_URL> [-m "comment"] [-f <file>] (or run inside issue dir), sync <ISSUE_CODE|FULL_URL> (or run inside issue dir), list');
+    console.log(HELP);
     process.exit(0);
   }
-  if (cmd === 'login') return cmdLogin(args);
-
-  const token = getToken();
-  if (!token) {
-    console.error('Missing token. Set LINEAR_API_KEY or run: linear-cli login <token>');
-    process.exit(1);
-  }
-
   try {
-    if (cmd === 'me') return cmdMe(token);
-    if (cmd === 'take') return cmdTake(token, args);
-    if (cmd === 'comments') return cmdComments(token, args);
-    if (cmd === 'sync') return cmdSync(token, args);
-    if (cmd === 'list') return cmdList();
-    console.error('Unknown command:', cmd);
-    process.exit(1);
+    if (cmd === 'login') return await cmdLogin(args);
+    const run = COMMANDS[cmd];
+    if (!run) {
+      console.error(`Unknown command: ${cmd}\nRun "linear-cli help" for usage.`);
+      process.exit(1);
+    }
+    if (cmd === 'list') return run();
+    const token = getToken();
+    if (!token) {
+      console.error('Missing token. Set LINEAR_API_KEY or run: linear-cli login <token>');
+      process.exit(1);
+    }
+    await run(token, args);
   } catch (e) {
     console.error('Error:', e.message);
     process.exit(1);
   }
 }
 
-main();
+if (require.main === module) {
+  main();
+}
+
+module.exports = { extractIssueCode, pickMatch, parseArgs, parseUploadRefs, rewriteMarkdownAttachments, buildMetadata };
