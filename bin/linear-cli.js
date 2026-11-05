@@ -128,7 +128,17 @@ async function fetchIssue(token, issueCode) {
   const q = `query Issue($id: String!) { issue(id: $id) { ${ISSUE_FIELDS} } }`;
   const data = await graphqlRequest(token, q, { id: issueCode });
   if (!data || !data.issue) throw new Error(`Issue ${issueCode} not found`);
-  return data.issue;
+  const issue = data.issue;
+  // Page through the rest of the comments so attachments in later comments are not missed.
+  let page = issue.comments?.pageInfo;
+  while (page && page.hasNextPage) {
+    const more = await graphqlRequest(token,
+      `query($id: String!, $after: String) { issue(id: $id) { comments(first: 100, after: $after) { nodes { id body createdAt user { id name } } pageInfo { hasNextPage endCursor } } } }`,
+      { id: issue.id, after: page.endCursor });
+    issue.comments.nodes.push(...more.issue.comments.nodes);
+    page = more.issue.comments.pageInfo;
+  }
+  return issue;
 }
 
 async function assignMe(token, issueCode, myUserId) {
@@ -218,18 +228,27 @@ async function writeIssueFolder(token, issue, folder) {
   ensureDir(attachmentsDir);
   const indexPath = path.join(attachmentsDir, 'index.csv');
   const index = loadIndex(indexPath);
-  const attPromises = metadata.attachments.map(att =>
-    downloadIfLinearAsset(token, att.url, attachmentsDir, undefined, index, indexPath)
-  );
-  const refPromises = parseUploadRefs(issue.description || '').map(ref =>
-    downloadIfLinearAsset(token, ref.url, attachmentsDir, ref.name, index, indexPath)
-  );
-  const commentRefPromises = (issue.comments?.nodes || []).flatMap(c =>
-    parseUploadRefs(c.body || '').map(ref =>
-      downloadIfLinearAsset(token, ref.url, attachmentsDir, ref.name, index, indexPath, 'comments')
-    )
-  );
-  await Promise.all([...attPromises, ...refPromises, ...commentRefPromises].map(p => p.catch(() => {})));
+  // One download per upload: the same file can be referenced from the description, several
+  // comments and the attachments list. First occurrence decides the folder.
+  const jobs = new Map();
+  const queue = (url, name, subdir) => {
+    if (!isLinearUpload(url)) return;
+    const key = getUploadsId(url) || url;
+    if (!jobs.has(key)) jobs.set(key, { url, name, subdir });
+  };
+  for (const att of metadata.attachments) queue(att.url, att.title, undefined);
+  for (const ref of parseUploadRefs(issue.description || '')) queue(ref.url, ref.name, undefined);
+  for (const c of issue.comments?.nodes || []) {
+    for (const ref of parseUploadRefs(c.body || '')) queue(ref.url, ref.name, 'comments');
+  }
+  const failures = [];
+  await Promise.all([...jobs.values()].map(j =>
+    downloadIfLinearAsset(token, j.url, attachmentsDir, j.name, index, indexPath, j.subdir)
+      .catch(e => failures.push(`${j.name || j.url}: ${e.message}`))
+  ));
+  if (failures.length) {
+    console.error(`Warning: ${failures.length} attachment(s) could not be downloaded:\n  ${failures.join('\n  ')}`);
+  }
 
   const header = [
     `Creator: ${issue.creator?.name || 'Unknown'}`,
@@ -316,8 +335,12 @@ function downloadIfLinearAsset(token, urlStr, attachmentsBaseDir, preferredName,
     const outDir = effectiveSubdir ? path.join(attachmentsBaseDir, effectiveSubdir) : attachmentsBaseDir;
     ensureDir(outDir);
 
-    const req = https.request(u, { method: 'GET', headers: { Authorization: authHeader(token) } }, (res) => {
-      if (res.statusCode !== 200) return reject(new Error('Download failed ' + res.statusCode));
+    httpGetFollow(u, { Authorization: authHeader(token) }, 5, (err, res) => {
+      if (err) return reject(err);
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error('download failed with HTTP ' + res.statusCode));
+      }
       let name = baseName;
       const cd = res.headers['content-disposition'];
       if (cd && !hasPriorMapping) {
@@ -343,9 +366,23 @@ function downloadIfLinearAsset(token, urlStr, attachmentsBaseDir, preferredName,
       });
       ws.on('error', reject);
     });
-    req.on('error', reject);
-    req.end();
   });
+}
+
+// GET that follows redirects. The Authorization header is only sent to uploads.linear.app,
+// never to whatever storage host a redirect points at.
+function httpGetFollow(u, headers, redirectsLeft, cb) {
+  const sendHeaders = u.hostname === 'uploads.linear.app' ? headers : {};
+  const req = https.request(u, { method: 'GET', headers: sendHeaders }, (res) => {
+    if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+      res.resume();
+      if (redirectsLeft <= 0) return cb(new Error('too many redirects'));
+      return httpGetFollow(new URL(res.headers.location, u), headers, redirectsLeft - 1, cb);
+    }
+    cb(null, res);
+  });
+  req.on('error', cb);
+  req.end();
 }
 
 function mimeToExt(mime) {
@@ -382,25 +419,34 @@ function uniqueFilePath(outDir, desiredName) {
   return fp;
 }
 
+// Linear upload URLs, including signed ones (`?signature=...`) returned because of the
+// `public-file-urls-expire-in` header.
+const UPLOAD_URL_RE = /https:\/\/uploads\.linear\.app\/[\w\-\/.%~]+(?:\?[^\s)"'<>\]]*[^\s)"'<>\].,;:])?/g;
+
+function isLinearUpload(url) {
+  return /^https:\/\/uploads\.linear\.app\//.test(url || '');
+}
+
+function cleanUploadUrl(url) {
+  return url.replace(/[.,;:]+$/, ''); // trailing sentence punctuation on raw URLs
+}
+
 function parseUploadRefs(markdown) {
   if (!markdown) return [];
-  const refs = [];
-  const imgRe = /!\[([^\]]*)\]\((https:\/\/uploads\.linear\.app\/[\w\-\/]+)\)/g;
-  const linkRe = /\[([^\]]*)\]\((https:\/\/uploads\.linear\.app\/[\w\-\/]+)\)/g;
+  const refs = new Map();
+  // Markdown links and images: [name](url) / ![name](url)
+  const mdRe = /!?\[([^\]]*)\]\((https:\/\/uploads\.linear\.app\/[^)\s]+)\)/g;
   let m;
-  while ((m = imgRe.exec(markdown)) !== null) {
-    refs.push({ url: m[2], name: m[1] || undefined });
+  while ((m = mdRe.exec(markdown)) !== null) {
+    const url = cleanUploadUrl(m[2]);
+    if (!refs.has(url)) refs.set(url, { url, name: m[1] || undefined });
   }
-  while ((m = linkRe.exec(markdown)) !== null) {
-    refs.push({ url: m[2], name: m[1] || undefined });
+  // Raw URLs
+  for (const raw of markdown.match(UPLOAD_URL_RE) || []) {
+    const url = cleanUploadUrl(raw);
+    if (!refs.has(url)) refs.set(url, { url, name: undefined });
   }
-  // Fallback: raw URLs without markdown
-  const rawRe = /(https:\/\/uploads\.linear\.app\/[\w\-\/]+)/g;
-  while ((m = rawRe.exec(markdown)) !== null) {
-    // Avoid duplicates
-    if (!refs.some(r => r.url === m[1])) refs.push({ url: m[1], name: undefined });
-  }
-  return refs;
+  return [...refs.values()];
 }
 
 function loadIndex(indexPath) {
@@ -409,7 +455,8 @@ function loadIndex(indexPath) {
     const txt = fs.readFileSync(indexPath, 'utf8');
     const lines = txt.split(/\r?\n/).filter(l => l.trim().length > 0);
     for (const line of lines.slice(1)) { // skip header if present
-      const [id, filename] = line.split(',');
+      const [id, ...rest] = line.split(',');
+      const filename = rest.join(',');
       if (id && filename) map[id.trim()] = filename.trim();
     }
   } catch {}
@@ -431,7 +478,8 @@ function rewriteMarkdownAttachments(markdown, index) {
   if (!markdown) return markdown;
   let out = markdown;
   for (const [id, filename] of Object.entries(index || {})) {
-    const urlPattern = new RegExp(`https\\:\\/\\/uploads\\.linear\\.app\\/[\\w\\-\\/]*${escapeRegExp(id)}`, 'g');
+    // Also swallow a signed-URL query string so local links don't end in `?signature=...`
+    const urlPattern = new RegExp(`https://uploads\\.linear\\.app/[\\w\\-/.%~]*${escapeRegExp(id)}(?:\\?[^\\s)"'<>\\]]*[^\\s)"'<>\\].,;:])?`, 'g');
     out = out.replace(urlPattern, `attachments/${filename}`);
   }
   return out;
@@ -441,60 +489,181 @@ function parseCommentArgs(argv) {
   let issueArg = null;
   let addBody = null;
   let files = [];
+  const attach = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '-m' || a === '--message') {
       addBody = argv[i + 1] || '';
       i++;
     } else if (a === '-f' || a === '--files') {
-      files = argv.slice(i + 1).filter(x => !x.startsWith('-'));
-      break;
+      while (i + 1 < argv.length && !argv[i + 1].startsWith('-')) files.push(argv[++i]);
+    } else if (a === '-a' || a === '--attach') {
+      while (i + 1 < argv.length && !argv[i + 1].startsWith('-')) attach.push(argv[++i]);
     } else if (!a.startsWith('-') && !issueArg) {
       issueArg = a;
     }
   }
-  return { issueArg, addBody, files };
+  return { issueArg, addBody, files, attach };
 }
 
-function isHttpUrl(s) { return /^https?:\/\//i.test(s || ''); }
+const EXT_MIME = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
+  svg: 'image/svg+xml', bmp: 'image/bmp', heic: 'image/heic',
+  pdf: 'application/pdf', zip: 'application/zip', gz: 'application/gzip', json: 'application/json',
+  txt: 'text/plain', log: 'text/plain', md: 'text/markdown', csv: 'text/csv', html: 'text/html',
+  mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm', mp3: 'audio/mpeg', wav: 'audio/wav',
+};
 
-function copyLocalAttachment(outDir, filePath) {
-  const base = path.basename(filePath);
-  const target = uniqueFilePath(outDir, sanitizeFileName(base));
-  fs.copyFileSync(filePath, target);
-  return path.basename(target);
+function guessMime(filePath) {
+  const ext = path.extname(filePath).slice(1).toLowerCase();
+  return EXT_MIME[ext] || 'application/octet-stream';
 }
 
-async function createIssueAttachment(token, issueId, url, title) {
-  const m = `mutation($input: AttachmentCreateInput!) { attachmentCreate(input: $input) { success attachment { id } } }`;
-  await graphqlRequest(token, m, { input: { issueId, url, title } }).catch(() => {});
+function isImageFile(filePath) {
+  return guessMime(filePath).startsWith('image/');
+}
+
+function putFile(uploadUrl, filePath, contentType, size, extraHeaders) {
+  return new Promise((resolve, reject) => {
+    const headers = {
+      'Content-Type': contentType,
+      'Content-Length': size,
+      'Cache-Control': 'public, max-age=31536000',
+    };
+    for (const h of extraHeaders || []) headers[h.key] = h.value;
+    const u = new URL(uploadUrl);
+    const transport = u.protocol === 'http:' ? http : https;
+    const req = transport.request(u, { method: 'PUT', headers }, (res) => {
+      res.resume();
+      if (res.statusCode >= 200 && res.statusCode < 300) resolve();
+      else reject(new Error(`upload failed with HTTP ${res.statusCode}`));
+    });
+    req.on('error', reject);
+    fs.createReadStream(filePath).on('error', reject).pipe(req);
+  });
+}
+
+// Uploads a local file to Linear's storage and returns its uploads.linear.app URL.
+async function uploadFile(token, filePath) {
+  const size = fs.statSync(filePath).size;
+  const contentType = guessMime(filePath);
+  const filename = path.basename(filePath);
+  const m = `mutation($contentType: String!, $filename: String!, $size: Int!) { fileUpload(contentType: $contentType, filename: $filename, size: $size) { success uploadFile { uploadUrl assetUrl headers { key value } } } }`;
+  const res = await graphqlRequest(token, m, { contentType, filename, size });
+  if (!res.fileUpload?.success) throw new Error(`Linear refused the upload of ${filename}`);
+  const { uploadUrl, assetUrl, headers } = res.fileUpload.uploadFile;
+  await putFile(uploadUrl, filePath, contentType, size, headers);
+  return assetUrl;
+}
+
+function expandHome(p) {
+  return p.startsWith('~/') ? path.join(os.homedir(), p.slice(2)) : p;
+}
+
+// Finds `![alt](path)` / `[text](path)` references to local files, outside fenced code blocks.
+function findLocalRefs(markdown) {
+  const refs = [];
+  const parts = markdown.split(/(^```[\s\S]*?^```)/m);
+  let offset = 0;
+  parts.forEach((part, idx) => {
+    if (idx % 2 === 0) {
+      const re = /(!?)\[([^\]]*)\]\(\s*(<[^>]+>|[^)\s]+)(\s+"[^"]*")?\s*\)/g;
+      let m;
+      while ((m = re.exec(part)) !== null) {
+        let target = m[3].replace(/^<|>$/g, '');
+        if (/^[a-z][a-z0-9+.-]*:/i.test(target) || target.startsWith('#') || target.startsWith('//')) continue;
+        try { target = decodeURIComponent(target); } catch {}
+        refs.push({ start: offset + m.index, end: offset + m.index + m[0].length, image: m[1] === '!', text: m[2], target, title: m[4] || '' });
+      }
+    }
+    offset += part.length;
+  });
+  return refs;
+}
+
+// Uploads every local file the markdown links to (resolved against baseDir) and rewrites
+// the links to the uploaded URLs. Links to missing files are left as they are, with a warning.
+async function uploadLocalRefs(token, markdown, baseDir) {
+  if (!markdown) return { markdown, uploaded: [] };
+  const refs = findLocalRefs(markdown);
+  const byPath = new Map();
+  for (const r of refs) {
+    const abs = path.resolve(baseDir, expandHome(r.target));
+    let ok = false;
+    try { ok = fs.statSync(abs).isFile(); } catch {}
+    if (!ok) {
+      console.error(`Warning: ${r.target} not found; leaving the link as is`);
+      continue;
+    }
+    r.abs = abs;
+    if (!byPath.has(abs)) byPath.set(abs, null);
+  }
+  for (const abs of byPath.keys()) {
+    byPath.set(abs, await uploadFile(token, abs));
+    console.log(`Uploaded ${path.relative(process.cwd(), abs) || abs}`);
+  }
+  let out = markdown;
+  for (const r of refs.slice().reverse()) {
+    if (!r.abs) continue;
+    const link = `${r.image ? '!' : ''}[${r.text}](${byPath.get(r.abs)}${r.title})`;
+    out = out.slice(0, r.start) + link + out.slice(r.end);
+  }
+  return { markdown: out, uploaded: [...byPath.keys()] };
+}
+
+// Uploads files given with --attach and returns markdown lines to append.
+async function uploadAttachments(token, files) {
+  const lines = [];
+  for (const f of files) {
+    const abs = path.resolve(expandHome(f));
+    if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) throw new Error(`Attachment not found: ${f}`);
+    const url = await uploadFile(token, abs);
+    const name = path.basename(abs);
+    lines.push(isImageFile(abs) ? `![${name}](${url})` : `[${name}](${url})`);
+    console.log(`Uploaded ${f}`);
+  }
+  return lines;
+}
+
+// Turns local markdown (+ --attach files) into a body ready to send to Linear.
+async function prepareBody(token, body, baseDir, attachFiles) {
+  let out = body || '';
+  out = (await uploadLocalRefs(token, out, baseDir)).markdown;
+  const extra = await uploadAttachments(token, attachFiles || []);
+  if (extra.length) out = (out.trim() ? out.replace(/\s*$/, '\n\n') : '') + extra.join('\n') + '\n';
+  return out;
 }
 
 async function cmdComments(token, argv) {
-  const { issueArg, addBody, files } = parseCommentArgs(argv);
+  const { issueArg, addBody, files, attach } = parseCommentArgs(argv);
   const issueCode = resolveIssueCode(issueArg);
   if (!issueCode) {
-    console.error('Usage: linear-cli comments <ISSUE_CODE|FULL_URL> [-m "comment"] [-f <file>] (or run inside issue directory)');
+    console.error('Usage: linear-cli comments <ISSUE_CODE|FULL_URL> [-m "comment"] [-f <file.md>] [-a <file>...] (or run inside issue directory)');
     process.exit(1);
   }
   const issue = await fetchIssue(token, issueCode);
 
   // Determine comment body: prefer -f file content, fallback to -m
+  // Local file links in the body are resolved against the -f file's folder (or cwd for -m).
   let body = null;
+  let baseDir = process.cwd();
   for (const f of files) {
     if (fs.existsSync(f)) {
       try {
         const st = fs.statSync(f);
         if (st.isFile()) {
           body = fs.readFileSync(f, 'utf8');
+          baseDir = path.dirname(path.resolve(f));
           break;
         }
       } catch {}
     }
   }
   if (body == null && addBody) body = addBody;
+  if (body == null && attach.length) body = '';
 
   if (body != null) {
+    body = await prepareBody(token, body, baseDir, attach);
     const m = `mutation($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id } } }`;
     await graphqlRequest(token, m, { input: { issueId: issue.id, body } });
   }
@@ -599,7 +768,12 @@ function parseArgs(argv, spec) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (Object.prototype.hasOwnProperty.call(spec, a)) {
-      if (spec[a]) {
+      if (spec[a] === 'multi') {
+        // Takes every following value up to the next flag: -a one.png two.pdf
+        const vals = flags[a] || (flags[a] = []);
+        while (i + 1 < argv.length && !argv[i + 1].startsWith('-')) vals.push(argv[++i]);
+        if (!vals.length) throw new Error(`Missing value for ${a}`);
+      } else if (spec[a]) {
         if (i + 1 >= argv.length) throw new Error(`Missing value for ${a}`);
         flags[a] = argv[++i];
       } else {
@@ -865,18 +1039,29 @@ async function cmdCreate(token, argv) {
     '-f': true, '--file': true,
     '-me': false, '--me': false,
     '--take': false,
+    '-a': 'multi', '--attach': 'multi',
   });
   const title = positionals.join(' ').trim();
   if (!title) {
-    console.error('Usage: linear-cli create [--team KEY] "Title" [-d "description" | -f file.md] [-me] [--take]');
+    console.error('Usage: linear-cli create [--team KEY] "Title" [-d "description" | -f file.md] [-a file...] [-me] [--take]');
     process.exit(1);
   }
   const team = await findTeam(token, flag(flags, '--team', '-t'));
   const input = { teamId: team.id, title };
   const file = flag(flags, '-f', '--file');
   const desc = flag(flags, '-d', '--description');
-  if (file) input.description = fs.readFileSync(file, 'utf8');
-  else if (desc) input.description = desc;
+  let description = null;
+  let baseDir = process.cwd();
+  if (file) {
+    description = fs.readFileSync(file, 'utf8');
+    baseDir = path.dirname(path.resolve(file));
+  } else if (desc) {
+    description = desc;
+  }
+  const attach = flag(flags, '-a', '--attach') || [];
+  if (description != null || attach.length) {
+    input.description = await prepareBody(token, description || '', baseDir, attach);
+  }
   if (flag(flags, '-me', '--me')) input.assigneeId = (await fetchViewer(token)).id;
   const m = `mutation($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier title url } } }`;
   const res = await graphqlRequest(token, m, { input });
@@ -965,8 +1150,8 @@ Local workflow:
   me                                  Show your user info
   take [-me] <ISSUE>                  Pull an issue locally (optionally assign yourself)
   sync [ISSUE]                        Refresh a locally stored issue
-  comments [ISSUE] [-m "text"] [-f file]
-                                      Read or post comments
+  comments [ISSUE] [-m "text"] [-f file.md] [-a file...]
+                                      Read or post comments (local files are uploaded)
   list                                Browse local issues (fzf if available)
 
 Find & triage:
@@ -978,11 +1163,13 @@ Find & triage:
   status [ISSUE] [STATE]              Show or change workflow state ("progress" → In Progress)
   assign [ISSUE] (-me | --none | <name|email>)
                                       Change the assignee
-  create [--team KEY] "Title" [-d text | -f file] [-me] [--take]
-                                      Create an issue
+  create [--team KEY] "Title" [-d text | -f file.md] [-a file...] [-me] [--take]
+                                      Create an issue (local files are uploaded)
   teams                               List teams and their keys
 
-ISSUE is a code (TEC-123) or URL; when omitted, it is taken from the current issue directory.`;
+ISSUE is a code (TEC-123) or URL; when omitted, it is taken from the current issue directory.
+Images and files linked from markdown (![](./shot.png), [log](../app.log)) are uploaded to Linear
+and the links rewritten; -a/--attach uploads extra files and appends links to them.`;
 
 const COMMANDS = {
   me: (t) => cmdMe(t),
@@ -1031,4 +1218,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { extractIssueCode, pickMatch, parseArgs, parseUploadRefs, rewriteMarkdownAttachments, buildMetadata };
+module.exports = { extractIssueCode, pickMatch, parseArgs, parseUploadRefs, rewriteMarkdownAttachments, buildMetadata, findLocalRefs };

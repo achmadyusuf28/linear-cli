@@ -33,7 +33,7 @@ linear-cli login --env
 |---------|-------------|
 | `linear-cli me` | Show your user info |
 | `linear-cli take [-me] ISSUE` | Pull an issue locally, optionally assign yourself |
-| `linear-cli comments [ISSUE] [-m "text"] [-f file]` | Read/post comments on an issue |
+| `linear-cli comments [ISSUE] [-m "text"] [-f file.md] [-a file...]` | Read/post comments on an issue |
 | `linear-cli sync [ISSUE]` | Refresh a locally stored issue |
 | `linear-cli list` | Browse local issues (uses fzf if available) |
 
@@ -48,10 +48,21 @@ linear-cli login --env
 | `linear-cli open [ISSUE]` | Open the issue in your browser |
 | `linear-cli status [ISSUE] [STATE]` | List states, or change state (fuzzy: `progress` → In Progress) |
 | `linear-cli assign [ISSUE] (-me \| --none \| <name\|email>)` | Change the assignee |
-| `linear-cli create [--team KEY] "Title" [-d text \| -f file] [-me] [--take]` | Create an issue (`--team` optional with a single team) |
+| `linear-cli create [--team KEY] "Title" [-d text \| -f file.md] [-a file...] [-me] [--take]` | Create an issue (`--team` optional with a single team) |
 | `linear-cli teams` | List teams and their keys |
 
 Using the `linear` wrapper, `take`, `create --take`, and picking from `mine`/`search` drop you into a shell inside the issue folder.
+
+### Attachments both ways
+
+- **Down:** `take`, `sync` and `comments` download files from the description, the attachments list and every comment (all pages). Comment files go in `attachments/comments/`, and links in `description.md` / `comments.md` are rewritten to the local copies. Files that fail to download are listed as a warning.
+- **Up:** when you post markdown with `create` or `comments`, local files it links to are uploaded to Linear and the links are rewritten to the uploaded URLs. Paths are resolved from the `-f` file's folder (or the current folder for `-d`/`-m`). Links inside fenced code blocks, web URLs and missing files are left alone. `-a/--attach` uploads extra files and appends links to them (images are embedded).
+
+```bash
+# issue.md contains ![repro](./screens/repro.png) and [logs](../server.log)
+linear create --team TEC "Checkout crashes on submit" -f issue.md -a trace.har -me --take
+linear comments -m "Fixed, see ![after](./after.png)"
+```
 
 Example `tree` output:
 

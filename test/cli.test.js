@@ -54,7 +54,26 @@ db['TEC-2'].projectMilestone = { name: 'Beta' };
 db['TEC-2'].cycle = { number: 7, name: null };
 db['TEC-2'].relations.nodes = [{ type: 'blocks', relatedIssue: brief(db['TEC-4']) }];
 db['TEC-2'].inverseRelations.nodes = [{ type: 'related', issue: brief(db['TEC-3']) }];
+// TEC-5: 60 comments (needs paging), with uploads in early and late comments.
+db['TEC-5'] = makeIssue(5, 'Has comment attachments');
+db['TEC-5'].comments.nodes = Array.from({ length: 60 }, (_, k) => ({
+  id: `c${k}`, createdAt: `2026-01-01T00:${String(k).padStart(2, '0')}:00Z`, user: { id: 'u2', name: 'Dana Lee' },
+  body: k === 0 ? 'Repro: ![screenshot.png](https://uploads.linear.app/org/aaa/up-shot?signature=sig123)'
+    : k === 1 ? 'Same image again https://uploads.linear.app/org/aaa/up-shot?signature=sig123. And [server.log](https://uploads.linear.app/org/bbb/up-log)'
+    : k === 59 ? 'Late one ![late.png](https://uploads.linear.app/org/ccc/up-late)'
+    : `comment ${k}`,
+}));
+
+// Fake storage: blobs by upload id. up-log redirects to a storage host like a signed-URL hop would.
+const blobs = {
+  'up-shot': { type: 'image/png', data: Buffer.from('PNGDATA-shot') },
+  'up-log': { type: 'text/plain', data: Buffer.from('log lines') },
+  'up-late': { type: 'image/png', data: Buffer.from('PNGDATA-late') },
+};
+const downloads = [];
+const puts = [];
 let nextId = 10;
+let nextUpload = 1;
 const requests = [];
 
 // Expands parent/children links on read so nested selections resolve.
@@ -100,19 +119,70 @@ function resolve(query, v) {
     db[i.identifier] = i;
     return { issueCreate: { success: true, issue: i } };
   }
-  if (/commentCreate/.test(query)) return { commentCreate: { success: true, comment: { id: 'c1' } } };
+  if (/commentCreate/.test(query)) {
+    const i = Object.values(db).find(x => x.id === v.input.issueId);
+    const c = { id: `new${i.comments.nodes.length}`, body: v.input.body, createdAt: '2026-02-01T00:00:00Z', user: { id: 'u1', name: 'Yusuf A' } };
+    i.comments.nodes.push(c);
+    return { commentCreate: { success: true, comment: { id: c.id } } };
+  }
+  if (/fileUpload/.test(query)) {
+    const id = `up-new${nextUpload++}`;
+    blobs[id] = { type: v.contentType, name: v.filename, size: v.size };
+    return { fileUpload: { success: true, uploadFile: {
+      uploadUrl: `http://127.0.0.1:${server.address().port}/put/${id}`,
+      assetUrl: `https://uploads.linear.app/org/new/${id}`,
+      headers: [{ key: 'x-goog-meta-test', value: 'yes' }],
+    } } };
+  }
+  if (/comments\(first: 100, after/.test(query)) {
+    const i = Object.values(db).find(x => x.id === v.id);
+    const start = Number(v.after);
+    return { issue: { comments: { nodes: i.comments.nodes.slice(start, start + 100), pageInfo: { hasNextPage: start + 100 < i.comments.nodes.length, endCursor: String(start + 100) } } } };
+  }
   if (/issue\(id/.test(query)) {
     const i = db[v.id];
     if (!i) return { __errors: [{ message: 'Entity not found: Issue' }] };
-    return { issue: hydrate(i) };
+    const h = hydrate(i);
+    // Like Linear: the first page holds 50 comments
+    const all = i.comments.nodes;
+    h.comments = { nodes: all.slice(0, 50), pageInfo: { hasNextPage: all.length > 50, endCursor: '50' } };
+    return { issue: h };
   }
   return { __errors: [{ message: 'mock: unhandled query' }] };
 }
 
+function handleFiles(req, res, raw) {
+  const put = req.url.match(/^\/put\/(.+)$/);
+  if (put && req.method === 'PUT') {
+    const b = blobs[put[1]];
+    b.data = raw;
+    puts.push({ id: put[1], headers: req.headers, data: raw });
+    return res.end();
+  }
+  const m = req.url.match(/^\/__https(\/[^?]*)(\?.*)?$/);
+  const host = req.headers['x-orig-host'];
+  const id = m[1].split('/').pop();
+  downloads.push({ host, path: m[1], query: m[2] || '', auth: req.headers.authorization });
+  if (host === 'uploads.linear.app') {
+    if (req.headers.authorization !== 'test-key') { res.statusCode = 401; return res.end(); }
+    if (id === 'up-log') {
+      res.statusCode = 302;
+      res.setHeader('Location', 'https://storage.example.com/bucket/up-log?X-Sig=abc');
+      return res.end();
+    }
+  }
+  const b = blobs[id];
+  if (!b || !b.data) { res.statusCode = 404; return res.end(); }
+  res.setHeader('Content-Type', b.type);
+  res.end(b.data);
+}
+
 const server = http.createServer((req, res) => {
-  let body = '';
-  req.on('data', (c) => (body += c));
+  const chunks = [];
+  req.on('data', (c) => chunks.push(c));
   req.on('end', () => {
+    if (req.url !== '/graphql') return handleFiles(req, res, Buffer.concat(chunks));
+    const body = Buffer.concat(chunks).toString('utf8');
     const { query, variables } = JSON.parse(body);
     requests.push({ query, variables, auth: req.headers.authorization });
     const data = resolve(query, variables || {});
@@ -127,7 +197,12 @@ function run(args, opts = {}) {
   return new Promise((resolve) => {
     execFile(process.execPath, [CLI, ...args], {
       cwd: opts.cwd || home,
-      env: { PATH: process.env.PATH, HOME: home, LINEAR_API_KEY: 'test-key', LINEAR_API_URL: `http://127.0.0.1:${server.address().port}/graphql` },
+      env: {
+        PATH: process.env.PATH, HOME: home, LINEAR_API_KEY: 'test-key',
+        LINEAR_API_URL: `http://127.0.0.1:${server.address().port}/graphql`,
+        MOCK_PORT: String(server.address().port),
+        NODE_OPTIONS: `--require ${path.join(__dirname, 'helpers', 'route-https.js')}`,
+      },
     }, (err, stdout, stderr) => resolve({ code: err ? err.code : 0, stdout, stderr }));
   });
 }
@@ -247,6 +322,92 @@ test('tree shows project, ancestors, children and relations', async () => {
   assert.match(mid.stdout, /^Cycle:   Cycle 7/m);
   assert.match(mid.stdout, /blocks\s+TEC-4 Backend API/);
   assert.match(mid.stdout, /related to\s+TEC-3 Card validation/);
+});
+
+test('comment attachments download: dedupe, signed URLs, redirects, paging', async () => {
+  downloads.length = 0;
+  const r = await run(['take', 'TEC-5']);
+  assert.strictEqual(r.code, 0, r.stderr);
+  assert.ok(!/Warning/.test(r.stderr), r.stderr);
+  const folder = r.stdout.match(/^Prepared (.+)$/m)[1];
+  const dir = path.join(folder, 'attachments', 'comments');
+  assert.strictEqual(fs.readFileSync(path.join(dir, 'screenshot.png'), 'utf8'), 'PNGDATA-shot');
+  assert.strictEqual(fs.readFileSync(path.join(dir, 'server.log'), 'utf8'), 'log lines');
+  assert.strictEqual(fs.readFileSync(path.join(dir, 'late.png'), 'utf8'), 'PNGDATA-late', 'comment 60 (second page) downloaded');
+  assert.strictEqual(downloads.filter(d => d.path.endsWith('up-shot')).length, 1, 'same upload fetched once');
+  assert.strictEqual(downloads.find(d => d.path.endsWith('up-shot')).query, '?signature=sig123', 'signed query kept for download');
+  const storage = downloads.find(d => d.host === 'storage.example.com');
+  assert.ok(storage, 'redirect followed');
+  assert.strictEqual(storage.auth, undefined, 'API key not sent to the redirect host');
+  const md = fs.readFileSync(path.join(folder, 'comments.md'), 'utf8');
+  assert.match(md, /!\[screenshot\.png\]\(attachments\/comments\/screenshot\.png\)/);
+  assert.match(md, /Same image again attachments\/comments\/screenshot\.png\. And/);
+  assert.match(md, /\[server\.log\]\(attachments\/comments\/server\.log\)/);
+  assert.ok(!md.includes('signature='), 'no dangling signed query in local links');
+  assert.ok(!md.includes('uploads.linear.app'), 'all upload links rewritten');
+});
+
+test('download failures are reported, not silent', async () => {
+  db['TEC-6'] = makeIssue(6, 'Broken upload', { description: '![gone.png](https://uploads.linear.app/org/x/up-missing)' });
+  const r = await run(['take', 'TEC-6']);
+  assert.strictEqual(r.code, 0);
+  assert.match(r.stderr, /Warning: 1 attachment\(s\) could not be downloaded:\n  gone\.png: download failed with HTTP 404/);
+});
+
+test('create uploads files linked from local markdown and --attach, then take pulls them back', async () => {
+  const work = fs.mkdtempSync(path.join(home, 'draft-'));
+  fs.mkdirSync(path.join(work, 'img'));
+  fs.writeFileSync(path.join(work, 'img', 'shot one.png'), 'LOCALPNG');
+  fs.writeFileSync(path.join(work, 'spec.pdf'), 'LOCALPDF');
+  fs.writeFileSync(path.join(work, 'extra.log'), 'EXTRALOG');
+  fs.writeFileSync(path.join(work, 'issue.md'), [
+    'Steps:',
+    '![shot](<img/shot one.png>)',
+    'See [the spec](./spec.pdf "Spec") and [again](spec.pdf).',
+    'Missing: ![m](missing.png)',
+    'Web: ![w](https://example.com/w.png) [anchor](#steps)',
+    '```',
+    '![code](./img/shot one.png)',
+    '```',
+  ].join('\n'));
+  puts.length = 0;
+  const r = await run(['create', 'With files', '-f', path.join(work, 'issue.md'), '-a', path.join(work, 'extra.log'), '--take']);
+  assert.strictEqual(r.code, 0, r.stderr);
+  assert.match(r.stderr, /Warning: missing\.png not found/);
+  assert.strictEqual(puts.length, 3, 'shot, spec (once), extra.log');
+  assert.deepStrictEqual(puts.map(p => p.data.toString()).sort(), ['EXTRALOG', 'LOCALPDF', 'LOCALPNG']);
+  const png = puts.find(p => p.data.toString() === 'LOCALPNG');
+  assert.strictEqual(png.headers['content-type'], 'image/png');
+  assert.strictEqual(png.headers['x-goog-meta-test'], 'yes', 'headers from fileUpload are sent');
+  const created = Object.values(db).find(i => i.title === 'With files');
+  const d = created.description;
+  assert.match(d, /!\[shot\]\(https:\/\/uploads\.linear\.app\/org\/new\/up-new\d+\)/);
+  assert.match(d, /\[the spec\]\(https:\/\/uploads\.linear\.app\/org\/new\/up-new\d+ "Spec"\)/);
+  assert.match(d, /!\[m\]\(missing\.png\)/, 'missing file left alone');
+  assert.match(d, /!\[w\]\(https:\/\/example\.com\/w\.png\) \[anchor\]\(#steps\)/);
+  assert.match(d, /```\n!\[code\]\(\.\/img\/shot one\.png\)\n```/, 'code block untouched');
+  assert.match(d, /\n\n\[extra\.log\]\(https:\/\/uploads\.linear\.app\/org\/new\/up-new\d+\)\n$/);
+  // Round trip: --take downloaded the uploads back into the new issue folder
+  const folder = r.stdout.match(/^Prepared (.+)$/m)[1];
+  const files = fs.readdirSync(path.join(folder, 'attachments')).sort();
+  assert.ok(files.includes('index.csv'));
+  assert.strictEqual(files.filter(f => f !== 'index.csv').length, 3, files.join(','));
+  assert.ok(!fs.readFileSync(path.join(folder, 'description.md'), 'utf8').includes('uploads.linear.app'));
+});
+
+test('comments -m with a local image and -a uploads both', async () => {
+  const work = fs.mkdtempSync(path.join(home, 'c-'));
+  fs.writeFileSync(path.join(work, 'a.png'), 'APNG');
+  fs.writeFileSync(path.join(work, 'b.txt'), 'BTXT');
+  puts.length = 0;
+  const r = await run(['comments', 'TEC-4', '-m', 'see ![a](./a.png)', '-a', 'b.txt'], { cwd: work });
+  assert.strictEqual(r.code, 0, r.stderr);
+  assert.strictEqual(puts.length, 2);
+  const body = db['TEC-4'].comments.nodes.slice(-1)[0].body;
+  assert.match(body, /^see !\[a\]\(https:\/\/uploads\.linear\.app\/org\/new\/up-new\d+\)\n\n\[b\.txt\]\(https:\/\/uploads/);
+  const only = await run(['comments', 'TEC-4', '-a', 'a.png'], { cwd: work });
+  assert.strictEqual(only.code, 0, only.stderr);
+  assert.match(db['TEC-4'].comments.nodes.slice(-1)[0].body, /^!\[a\.png\]\(https:\/\/uploads/);
 });
 
 test('unit: extractIssueCode and pickMatch', async () => {
