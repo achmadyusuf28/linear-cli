@@ -6,9 +6,10 @@ const http = require('http');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 
 const CLI = path.join(__dirname, '..', 'bin', 'linear-cli.js');
+const MCP = path.join(__dirname, '..', 'bin', 'linear-mcp.js');
 
 const states = [
   { id: 's1', name: 'Backlog', type: 'backlog', position: 0 },
@@ -193,18 +194,56 @@ const server = http.createServer((req, res) => {
 
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 'linear-cli-test-'));
 
+function testEnv() {
+  return {
+    PATH: process.env.PATH, HOME: home, LINEAR_API_KEY: 'test-key',
+    LINEAR_API_URL: `http://127.0.0.1:${server.address().port}/graphql`,
+    MOCK_PORT: String(server.address().port),
+    NODE_OPTIONS: `--require ${path.join(__dirname, 'helpers', 'route-https.js')}`,
+  };
+}
+
 function run(args, opts = {}) {
   return new Promise((resolve) => {
-    execFile(process.execPath, [CLI, ...args], {
-      cwd: opts.cwd || home,
-      env: {
-        PATH: process.env.PATH, HOME: home, LINEAR_API_KEY: 'test-key',
-        LINEAR_API_URL: `http://127.0.0.1:${server.address().port}/graphql`,
-        MOCK_PORT: String(server.address().port),
-        NODE_OPTIONS: `--require ${path.join(__dirname, 'helpers', 'route-https.js')}`,
-      },
-    }, (err, stdout, stderr) => resolve({ code: err ? err.code : 0, stdout, stderr }));
+    execFile(process.execPath, [CLI, ...args], { cwd: opts.cwd || home, env: testEnv() },
+      (err, stdout, stderr) => resolve({ code: err ? err.code : 0, stdout, stderr }));
   });
+}
+
+// Starts the MCP server and returns { request(method, params), call(tool, args), close() }.
+function mcpSession(opts = {}) {
+  const proc = spawn(process.execPath, opts.viaCli ? [CLI, 'mcp'] : [MCP], { cwd: opts.cwd || home, env: { ...testEnv(), ...(opts.env || {}) } });
+  let buf = '';
+  let nextReq = 1;
+  const waiting = new Map();
+  const lines = [];
+  proc.stdout.setEncoding('utf8');
+  proc.stdout.on('data', (chunk) => {
+    buf += chunk;
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      lines.push(line);
+      const msg = JSON.parse(line); // every stdout line must be JSON-RPC
+      const w = waiting.get(msg.id);
+      if (w) { waiting.delete(msg.id); w(msg); }
+    }
+  });
+  const send = (obj) => proc.stdin.write(JSON.stringify(obj) + '\n');
+  const request = (method, params) => new Promise((resolve) => {
+    const id = nextReq++;
+    waiting.set(id, resolve);
+    send({ jsonrpc: '2.0', id, method, params });
+  });
+  const call = async (name, args) => {
+    const res = await request('tools/call', { name, arguments: args });
+    const r = res.result;
+    const json = r.isError ? null : JSON.parse(r.content.find(c => c.text.startsWith('{') || c.text.startsWith('[')).text);
+    return { ...r, json, text: r.content.map(c => c.text).join('\n') };
+  };
+  const close = () => new Promise((resolve) => { proc.on('close', resolve); proc.stdin.end(); });
+  return { request, call, send, close, lines };
 }
 
 const tests = [];
@@ -408,6 +447,105 @@ test('comments -m with a local image and -a uploads both', async () => {
   const only = await run(['comments', 'TEC-4', '-a', 'a.png'], { cwd: work });
   assert.strictEqual(only.code, 0, only.stderr);
   assert.match(db['TEC-4'].comments.nodes.slice(-1)[0].body, /^!\[a\.png\]\(https:\/\/uploads/);
+});
+
+test('mcp: initialize, tools/list, ping, unknown method', async () => {
+  const m = mcpSession({ viaCli: true });
+  const init = await m.request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '1' } });
+  assert.strictEqual(init.result.protocolVersion, '2025-06-18');
+  assert.strictEqual(init.result.serverInfo.name, 'linear-cli');
+  assert.ok(init.result.capabilities.tools);
+  m.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+  const old = await m.request('initialize', { protocolVersion: '1999-01-01' });
+  assert.strictEqual(old.result.protocolVersion, '2025-06-18', 'falls back to a supported version');
+  const list = await m.request('tools/list', {});
+  const names = list.result.tools.map(t => t.name);
+  for (const n of ['linear_my_issues', 'linear_search_issues', 'linear_get_issue', 'linear_issue_tree', 'linear_set_status',
+    'linear_assign_issue', 'linear_create_issue', 'linear_add_comment', 'linear_take_issue', 'linear_sync_issue']) assert.ok(names.includes(n), n);
+  assert.ok(list.result.tools.every(t => t.inputSchema && t.inputSchema.type === 'object'));
+  assert.deepStrictEqual((await m.request('ping')).result, {});
+  assert.strictEqual((await m.request('nope/nothing')).error.code, -32601);
+  await m.close();
+  assert.ok(m.lines.every(l => JSON.parse(l).jsonrpc === '2.0'), 'stdout has only protocol messages');
+});
+
+test('mcp: read tools return the same data as the CLI', async () => {
+  const m = mcpSession();
+  const mine = await m.call('linear_my_issues', {});
+  assert.ok(mine.json.some(i => i.identifier === 'TEC-2'));
+  const found = await m.call('linear_search_issues', { query: 'card' });
+  assert.deepStrictEqual(found.json.map(i => i.identifier), ['TEC-3']);
+  const issue = await m.call('linear_get_issue', { issue: 'https://linear.app/acme/issue/TEC-2/payment-form' });
+  assert.strictEqual(issue.json.parent.identifier, 'TEC-1');
+  assert.deepStrictEqual(issue.json.children.map(c => c.identifier), ['TEC-3']);
+  assert.strictEqual(issue.json.description, 'Body of 2');
+  const tree = await m.call('linear_issue_tree', { issue: 'TEC-1', depth: 3 });
+  assert.match(tree.content[0].text, /└── TEC-2 Payment form/);
+  assert.match(tree.content[0].text, /    └── TEC-3 Card validation/);
+  assert.strictEqual(tree.json.children[0].children[0].identifier, 'TEC-3');
+  const states = await m.call('linear_list_states', { issue: 'TEC-3' });
+  assert.deepStrictEqual(states.json.states.map(s => s.name), ['Backlog', 'Todo', 'In Progress', 'In Review', 'Done']);
+  const teams = await m.call('linear_list_teams', {});
+  assert.strictEqual(teams.json[0].key, 'TEC');
+  await m.close();
+});
+
+test('mcp: errors come back as tool errors, not crashes', async () => {
+  const m = mcpSession();
+  const missing = await m.call('linear_get_issue', { issue: 'TEC-999' });
+  assert.strictEqual(missing.isError, true);
+  assert.match(missing.text, /Entity not found/);
+  const bad = await m.call('linear_get_issue', { issue: 'not an issue' });
+  assert.match(bad.text, /must be an issue code/);
+  const amb = await m.call('linear_set_status', { issue: 'TEC-3', state: 'in' });
+  assert.match(amb.text, /ambiguous: In Progress, In Review/);
+  const unknown = await m.call('linear_nope', {});
+  assert.strictEqual(unknown.isError, true);
+  await m.close();
+  const noKey = mcpSession({ env: { LINEAR_API_KEY: '' } });
+  const r = await noKey.call('linear_whoami', {});
+  assert.match(r.text, /Missing Linear API key/);
+  await noKey.close();
+});
+
+test('mcp: write tools change state, assignee, comments and create issues', async () => {
+  const work = fs.mkdtempSync(path.join(home, 'mcp-'));
+  fs.writeFileSync(path.join(work, 'shot.png'), 'MCPPNG');
+  fs.writeFileSync(path.join(work, 'x.log'), 'MCPLOG');
+  const m = mcpSession();
+  const st = await m.call('linear_set_status', { issue: 'TEC-3', state: 'review' });
+  assert.deepStrictEqual([st.json.from, st.json.to, st.json.changed], ['Todo', 'In Review', true]);
+  const as = await m.call('linear_assign_issue', { issue: 'TEC-3', assignee: 'dana@example.com' });
+  assert.strictEqual(as.json.assignee, 'Dana Lee');
+  assert.strictEqual((await m.call('linear_assign_issue', { issue: 'TEC-3', assignee: 'none' })).json.assignee, null);
+  puts.length = 0;
+  const c = await m.call('linear_add_comment', { issue: 'TEC-3', body: 'from mcp ![s](shot.png)', attachments: ['x.log'], base_dir: work });
+  assert.ok(!c.isError, c.text);
+  assert.strictEqual(puts.length, 2);
+  assert.match(db['TEC-3'].comments.nodes.slice(-1)[0].body, /^from mcp !\[s\]\(https:\/\/uploads\.linear\.app\/.+\)\n\n\[x\.log\]\(https:\/\/uploads/);
+  assert.match(c.text, /Uploaded shot\.png|Uploaded .*shot\.png/, 'upload notes returned to the client');
+  const created = await m.call('linear_create_issue', { title: 'Made by MCP', description: 'hi', assign_to_me: true, take: true });
+  assert.ok(!created.isError, created.text);
+  assert.match(created.json.identifier, /^TEC-\d+$/);
+  assert.ok(fs.existsSync(path.join(created.json.localFolder, 'metadata.json')));
+  const local = await m.call('linear_list_local_issues', {});
+  assert.ok(local.json.some(i => i.identifier === created.json.identifier));
+  await m.close();
+});
+
+test('mcp: take and sync write the same folder layout as the CLI', async () => {
+  const m = mcpSession();
+  const t = await m.call('linear_take_issue', { issue: 'TEC-4' });
+  assert.ok(!t.isError, t.text);
+  for (const f of ['metadata.json', 'description.md', 'comments.md']) assert.ok(fs.existsSync(path.join(t.json.folder, f)), f);
+  const again = await m.call('linear_take_issue', { issue: 'TEC-4' });
+  assert.strictEqual(again.json.alreadyPrepared, true);
+  const s = await m.call('linear_sync_issue', { issue: 'TEC-4' });
+  assert.strictEqual(s.json.folder, t.json.folder);
+  await m.close();
+  // And the CLI sees it
+  const cli = await run(['take', 'TEC-4']);
+  assert.match(cli.stdout, new RegExp(`Already prepared at ${t.json.folder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
 });
 
 test('unit: extractIssueCode and pickMatch', async () => {
