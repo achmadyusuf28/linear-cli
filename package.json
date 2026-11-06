@@ -1,14 +1,16 @@
 {
   "name": "linear-cli",
   "version": "0.2.0",
-  "description": "CLI to work with Linear issues locally \u2014 pull issues, download attachments, manage comments",
+  "description": "CLI and MCP server to work with Linear issues locally — pull issues, download attachments, manage comments",
   "license": "MIT",
   "bin": {
-    "linear-cli": "bin/linear"
+    "linear-cli": "bin/linear",
+    "linear-mcp": "bin/linear-mcp.js"
   },
   "scripts": {
     "start": "node bin/linear-cli.js",
-    "test": "node test/cli.test.js"
+    "test": "node test/cli.test.js",
+    "mcp": "node bin/linear-mcp.js"
   },
   "repository": {
     "type": "git",
@@ -18,7 +20,8 @@
     "linear",
     "cli",
     "linear-app",
-    "issues"
+    "issues",
+    "mcp"
   ],
   "engines": {
     "node": ">=14"
