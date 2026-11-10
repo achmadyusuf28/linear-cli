@@ -1,6 +1,8 @@
 # linear-cli
 
-Work with Linear issues from your terminal. Pull issue descriptions and attachments to local folders, assign yourself, manage comments, and browse offline.
+Work with Linear issues from your terminal, or from an AI assistant over MCP. Pull issue descriptions and attachments to local folders, assign yourself, manage comments, and browse offline.
+
+The same functions back both front ends: `bin/linear-cli.js` (CLI) and `lib/mcp.js` (MCP server) are thin layers over `lib/core.js`.
 
 ## Install
 
@@ -79,6 +81,48 @@ Relations:
   related to     TEC-3 Card validation [Todo]
 ```
 
+## MCP server
+
+The package also ships an MCP server (stdio), so Claude Code, Claude Desktop, Cursor and other MCP clients can use the same features as tools. Start it with `linear-mcp` or `linear-cli mcp`. It reads the API key the same way the CLI does (`LINEAR_API_KEY`, or the key saved by `linear-cli login`).
+
+Claude Code:
+
+```bash
+claude mcp add linear -e LINEAR_API_KEY=lin_api_... -- linear-mcp
+```
+
+Claude Desktop / Cursor (`mcpServers` in the client's config file):
+
+```json
+{
+  "mcpServers": {
+    "linear": {
+      "command": "linear-mcp",
+      "env": { "LINEAR_API_KEY": "lin_api_..." }
+    }
+  }
+}
+```
+
+If `linear-mcp` isn't on the client's PATH, use `"command": "node", "args": ["/path/to/linear-cli/bin/linear-mcp.js"]`.
+
+| Tool | CLI equivalent |
+|------|----------------|
+| `linear_whoami` | `me` |
+| `linear_my_issues` | `mine` |
+| `linear_search_issues` | `search` |
+| `linear_get_issue` | `show` (plus description and comments) |
+| `linear_issue_tree` | `tree` (rendered text and JSON) |
+| `linear_list_teams` | `teams` |
+| `linear_list_states` / `linear_set_status` | `status` |
+| `linear_assign_issue` | `assign` (`me`, `none`, or a name/email) |
+| `linear_create_issue` | `create` (local files in the description are uploaded; `take: true` pulls it locally) |
+| `linear_add_comment` | `comments -m` (local files are uploaded) |
+| `linear_take_issue` / `linear_sync_issue` | `take` / `sync` |
+| `linear_list_local_issues` | `list` |
+
+Issue arguments are a code (`TEC-123`) or a Linear URL. Relative file paths in `linear_create_issue` and `linear_add_comment` are resolved against `base_dir` (default: the server's working directory). Errors come back as tool errors with the same messages as the CLI.
+
 ## Folder structure
 
 Issues are stored under `~/linear-issues/<YYYY-MM-DD>/<ISSUE_CODE>/`:
@@ -103,7 +147,7 @@ Issues are stored under `~/linear-issues/<YYYY-MM-DD>/<ISSUE_CODE>/`:
 npm test
 ```
 
-Tests run the CLI against an in-process mock of the Linear GraphQL API (`LINEAR_API_URL` points the CLI at it), so no API key or network is needed.
+Tests run the CLI and the MCP server against an in-process mock of the Linear GraphQL API (`LINEAR_API_URL` points them at it), so no API key or network is needed.
 
 ## License
 
