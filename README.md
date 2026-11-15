@@ -45,11 +45,12 @@ linear-cli login --env
 |---------|-------------|
 | `linear-cli mine [--all] [--team KEY]` | Your open assigned issues. With fzf, the picked issue is pulled via `take` |
 | `linear-cli search <text> [--team KEY] [--all]` | Search issues. With fzf, the picked issue is pulled via `take` |
-| `linear-cli show [ISSUE]` | Print state, priority, assignee, labels, project, parent, sub-issues, relations |
+| `linear-cli show [ISSUE]` | Print state, priority, estimate, assignee, labels, project, parent, sub-issues, relations |
 | `linear-cli tree [ISSUE] [--depth N]` | Show the project, parent chain, sub-issue tree and relations |
 | `linear-cli open [ISSUE]` | Open the issue in your browser |
 | `linear-cli status [ISSUE] [STATE]` | List states, or change state (fuzzy: `progress` → In Progress) |
 | `linear-cli assign [ISSUE] (-me \| --none \| <name\|email>)` | Change the assignee |
+| `linear-cli estimate [ISSUE] [VALUE \| --none]` | Show the team's estimate scale, or set/clear the estimate (`3`, `M`); values off the scale are rejected |
 | `linear-cli create [--team KEY] "Title" [-d text \| -f file.md] [-a file...] [-me] [--take]` | Create an issue (`--team` optional with a single team) |
 | `linear-cli teams` | List teams and their keys |
 
@@ -116,6 +117,7 @@ If `linear-mcp` isn't on the client's PATH, use `"command": "node", "args": ["/p
 | `linear_list_teams` | `teams` |
 | `linear_list_states` / `linear_set_status` | `status` |
 | `linear_assign_issue` | `assign` (`me`, `none`, or a name/email) |
+| `linear_list_estimates` / `linear_set_estimate` | `estimate` (`null` or `"none"` clears it) |
 | `linear_create_issue` | `create` (local files in the description are uploaded; `take: true` pulls it locally) |
 | `linear_add_comment` | `comments -m` (local files are uploaded) |
 | `linear_take_issue` / `linear_sync_issue` | `take` / `sync` |

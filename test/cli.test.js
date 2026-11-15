@@ -23,7 +23,7 @@ const users = [
   { id: 'u2', name: 'Dana Lee', displayName: 'dana', email: 'dana@example.com', active: true },
   { id: 'u3', name: 'Dan Park', displayName: 'danp', email: 'danp@example.com', active: true },
 ];
-const team = { id: 't1', key: 'TEC', name: 'Tech' };
+const team = { id: 't1', key: 'TEC', name: 'Tech', issueEstimationType: 'fibonacci', issueEstimationAllowZero: false, issueEstimationExtended: false };
 const brief = (i) => ({ id: i.id, identifier: i.identifier, title: i.title, state: i.state });
 
 function makeIssue(n, title, extra = {}) {
@@ -107,6 +107,7 @@ function resolve(query, v) {
   if (/issueUpdate/.test(query)) {
     const i = Object.values(db).find(x => x.id === v.id || x.identifier === v.id);
     if (v.input.stateId) i.state = states.find(s => s.id === v.input.stateId);
+    if ('estimate' in v.input) i.estimate = v.input.estimate;
     if ('assigneeId' in v.input) {
       const u = users.find(u => u.id === v.input.assigneeId);
       i.assignee = u ? { id: u.id, name: u.name } : null;
@@ -251,7 +252,7 @@ const test = (name, fn) => tests.push({ name, fn });
 
 test('help lists new commands', async () => {
   const r = await run(['help']);
-  for (const c of ['mine', 'search', 'show', 'tree', 'open', 'status', 'assign', 'create', 'teams']) assert.ok(r.stdout.includes(`  ${c}`), c);
+  for (const c of ['mine', 'search', 'show', 'tree', 'open', 'status', 'assign', 'estimate', 'create', 'teams']) assert.ok(r.stdout.includes(`  ${c}`), c);
 });
 
 test('errors are reported cleanly with exit code 1', async () => {
@@ -327,6 +328,62 @@ test('assign by name, ambiguity, -me and --none', async () => {
   assert.match(r.stdout, /TEC-3 unassigned/);
   r = await run(['assign', 'TEC-3']);
   assert.strictEqual(r.code, 1);
+});
+
+test('estimate shows the scale, sets on-scale values and clears', async () => {
+  const folder = (await run(['take', 'TEC-4'])).stdout.match(/^(?:Prepared|Already prepared at) (.+)$/m)[1];
+  let r = await run(['estimate'], { cwd: folder });
+  assert.strictEqual(r.code, 0, r.stderr);
+  assert.match(r.stdout, /TEC-4 estimate: none/);
+  assert.match(r.stdout, /fibonacci scale:\n {4}1\n {4}2\n {4}3\n {4}5\n {4}8$/m);
+  r = await run(['estimate', '5'], { cwd: folder });
+  assert.strictEqual(r.code, 0, r.stderr);
+  assert.match(r.stdout, /TEC-4 estimate: none → 5/);
+  const update = requests.filter(q => /issueUpdate/.test(q.query)).pop();
+  assert.deepStrictEqual(update.variables, { id: 'i4', input: { estimate: 5 } });
+  const meta = JSON.parse(fs.readFileSync(path.join(folder, 'metadata.json'), 'utf8'));
+  assert.deepStrictEqual([meta.estimate, meta.estimateLabel], [5, '5'], 'local metadata refreshed');
+  assert.match(fs.readFileSync(path.join(folder, 'description.md'), 'utf8'), /^Estimate: 5$/m);
+  assert.match((await run(['show', 'TEC-4'])).stdout, /^Estimate: +5$/m);
+  assert.match((await run(['estimate', 'TEC-4'])).stdout, /  \* 5/);
+  assert.match((await run(['estimate', 'TEC-4', '5'])).stdout, /already estimated at 5/);
+  const sent = requests.length;
+  r = await run(['estimate', 'TEC-4', '4']);
+  assert.strictEqual(r.code, 1);
+  assert.match(r.stderr, /"4" is not on team TEC's fibonacci scale\. Allowed: 1, 2, 3, 5, 8/);
+  assert.ok(!requests.slice(sent).some(q => /issueUpdate/.test(q.query)), 'nothing sent for an invalid value');
+  r = await run(['estimate', 'TEC-4', '--none']);
+  assert.match(r.stdout, /TEC-4 estimate: 5 → none/);
+  assert.strictEqual(db['TEC-4'].estimate, null);
+  assert.strictEqual((await run(['estimate', 'TEC-4', '3', '--none'])).code, 1, 'value and --none together is a usage error');
+});
+
+test('estimate follows the team scale: t-shirt, extended, zero, off', async () => {
+  const saved = { ...team };
+  try {
+    Object.assign(team, { issueEstimationType: 'tShirt', issueEstimationExtended: true, issueEstimationAllowZero: true });
+    let r = await run(['estimate', 'TEC-3']);
+    assert.match(r.stdout, /tShirt scale:\n {4}None \(0\)\n {4}XS \(1\)\n {4}S \(2\)\n {4}M \(3\)\n {4}L \(5\)\n {4}XL \(8\)\n {4}XXL \(13\)\n {4}XXXL \(21\)$/m);
+    r = await run(['estimate', 'TEC-3', 'xl']);
+    assert.match(r.stdout, /TEC-3 estimate: none → XL/);
+    assert.strictEqual(db['TEC-3'].estimate, 8);
+    r = await run(['estimate', 'TEC-3', '0']);
+    assert.match(r.stdout, /XL → None/);
+    assert.strictEqual(db['TEC-3'].estimate, 0, 'zero is a value, not a clear');
+    Object.assign(team, { issueEstimationType: 'exponential', issueEstimationExtended: false, issueEstimationAllowZero: false });
+    assert.match((await run(['estimate', 'TEC-3', '32'])).stderr, /Allowed: 1, 2, 4, 8, 16$/m);
+    assert.match((await run(['estimate', 'TEC-3', '16'])).stdout, /→ 16/);
+    Object.assign(team, { issueEstimationType: 'notUsed' });
+    r = await run(['estimate', 'TEC-3']);
+    assert.match(r.stdout, /Estimates are turned off for team TEC/);
+    r = await run(['estimate', 'TEC-3', '2']);
+    assert.strictEqual(r.code, 1);
+    assert.match(r.stderr, /Estimates are turned off for team TEC/);
+    assert.strictEqual((await run(['estimate', 'TEC-3', 'none'])).code, 0, 'clearing still works');
+    assert.strictEqual(db['TEC-3'].estimate, null);
+  } finally {
+    Object.assign(team, saved);
+  }
 });
 
 test('teams and create --take', async () => {
@@ -461,7 +518,7 @@ test('mcp: initialize, tools/list, ping, unknown method', async () => {
   const list = await m.request('tools/list', {});
   const names = list.result.tools.map(t => t.name);
   for (const n of ['linear_my_issues', 'linear_search_issues', 'linear_get_issue', 'linear_issue_tree', 'linear_set_status',
-    'linear_assign_issue', 'linear_create_issue', 'linear_add_comment', 'linear_take_issue', 'linear_sync_issue']) assert.ok(names.includes(n), n);
+    'linear_assign_issue', 'linear_list_estimates', 'linear_set_estimate', 'linear_create_issue', 'linear_add_comment', 'linear_take_issue', 'linear_sync_issue']) assert.ok(names.includes(n), n);
   assert.ok(list.result.tools.every(t => t.inputSchema && t.inputSchema.type === 'object'));
   assert.deepStrictEqual((await m.request('ping')).result, {});
   assert.strictEqual((await m.request('nope/nothing')).error.code, -32601);
@@ -518,6 +575,16 @@ test('mcp: write tools change state, assignee, comments and create issues', asyn
   const as = await m.call('linear_assign_issue', { issue: 'TEC-3', assignee: 'dana@example.com' });
   assert.strictEqual(as.json.assignee, 'Dana Lee');
   assert.strictEqual((await m.call('linear_assign_issue', { issue: 'TEC-3', assignee: 'none' })).json.assignee, null);
+  const est = await m.call('linear_list_estimates', { issue: 'TEC-3' });
+  assert.deepStrictEqual([est.json.scale, est.json.options.map(o => o.value)], ['fibonacci', [1, 2, 3, 5, 8]]);
+  const se = await m.call('linear_set_estimate', { issue: 'TEC-3', estimate: 8 });
+  assert.deepStrictEqual([se.json.to, se.json.estimate, se.json.changed], ['8', 8, true]);
+  assert.strictEqual((await m.call('linear_get_issue', { issue: 'TEC-3' })).json.estimate, 8);
+  const bad = await m.call('linear_set_estimate', { issue: 'TEC-3', estimate: 13 });
+  assert.strictEqual(bad.isError, true);
+  assert.match(bad.text, /Allowed: 1, 2, 3, 5, 8/);
+  assert.strictEqual((await m.call('linear_set_estimate', { issue: 'TEC-3', estimate: null })).json.estimate, null);
+  assert.strictEqual(db['TEC-3'].estimate, null);
   puts.length = 0;
   const c = await m.call('linear_add_comment', { issue: 'TEC-3', body: 'from mcp ![s](shot.png)', attachments: ['x.log'], base_dir: work });
   assert.ok(!c.isError, c.text);

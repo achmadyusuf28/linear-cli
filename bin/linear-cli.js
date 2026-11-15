@@ -211,6 +211,7 @@ async function cmdShow(token, argv) {
   const rows = [
     ['State', i.state?.name],
     ['Priority', i.priorityLabel],
+    ['Estimate', core.estimateLabel(i.estimate, i.team)],
     ['Assignee', i.assignee?.name || 'Unassigned'],
     ['Creator', i.creator?.name],
     ['Team', i.team ? `${i.team.name} (${i.team.key})` : null],
@@ -288,6 +289,32 @@ async function cmdAssign(token, argv) {
   console.log(r.assignee ? `${r.identifier} assigned to ${r.assignee}` : `${r.identifier} unassigned`);
 }
 
+async function cmdEstimate(token, argv) {
+  const { flags, positionals } = parseArgs(argv, { '--none': false, '--clear': false });
+  // `estimate VALUE` inside an issue dir, or `estimate ISSUE [VALUE]`
+  let issueArg = null;
+  let rest = positionals;
+  if (positionals.length && looksLikeIssueRef(positionals[0])) {
+    issueArg = positionals[0];
+    rest = positionals.slice(1);
+  }
+  const issueCode = resolveIssueCode(issueArg);
+  const clear = !!flag(flags, '--none', '--clear');
+  const wanted = rest.join(' ').trim();
+  if (!issueCode || (clear && wanted)) usage('Usage: linear-cli estimate [ISSUE_CODE] [VALUE | --none] (or run inside issue directory)');
+  if (!clear && !wanted) {
+    const { issue, team, options } = await core.listEstimates(token, issueCode);
+    console.log(`${issue.identifier} estimate: ${issue.estimateLabel ?? 'none'}`);
+    if (!options.length) return console.log(`\nEstimates are turned off for team ${team.key}.`);
+    console.log(`\nTeam ${team.key} uses the ${team.type} scale:`);
+    for (const o of options) console.log(`  ${o.value === issue.estimate ? '*' : ' '} ${o.label}${o.label !== String(o.value) ? ` (${o.value})` : ''}`);
+    return;
+  }
+  const r = await core.setEstimate(token, issueCode, clear ? null : wanted);
+  if (!r.changed) console.log(r.to == null ? `${r.identifier} has no estimate` : `${r.identifier} is already estimated at ${r.to}`);
+  else console.log(`${r.identifier} estimate: ${r.from ?? 'none'} → ${r.to ?? 'none'}`);
+}
+
 async function cmdTeams(token) {
   const teams = await core.listTeams(token);
   if (!teams.length) return console.log('No teams found.');
@@ -351,6 +378,7 @@ Find & triage:
   status [ISSUE] [STATE]              Show or change workflow state ("progress" → In Progress)
   assign [ISSUE] (-me | --none | <name|email>)
                                       Change the assignee
+  estimate [ISSUE] [VALUE | --none]   Show the team's scale, or set/clear the estimate (3, M, ...)
   create [--team KEY] "Title" [-d text | -f file.md] [-a file...] [-me] [--take]
                                       Create an issue (local files are uploaded)
   teams                               List teams and their keys
@@ -375,6 +403,7 @@ const COMMANDS = {
   open: cmdOpen,
   status: cmdStatus,
   assign: cmdAssign,
+  estimate: cmdEstimate,
   teams: (t) => cmdTeams(t),
   create: cmdCreate,
 };
