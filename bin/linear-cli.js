@@ -54,9 +54,13 @@ function parseCommentArgs(argv) {
   let addBody = null;
   const files = [];
   const attach = [];
+  let replyTo = null;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '-m' || a === '--message') {
+    if (a === '-r' || a === '--reply') {
+      replyTo = argv[i + 1] || '';
+      i++;
+    } else if (a === '-m' || a === '--message') {
       addBody = argv[i + 1] || '';
       i++;
     } else if (a === '-f' || a === '--files') {
@@ -67,13 +71,13 @@ function parseCommentArgs(argv) {
       issueArg = a;
     }
   }
-  return { issueArg, addBody, files, attach };
+  return { issueArg, addBody, files, attach, replyTo };
 }
 
 async function cmdComments(token, argv) {
-  const { issueArg, addBody, files, attach } = parseCommentArgs(argv);
+  const { issueArg, addBody, files, attach, replyTo } = parseCommentArgs(argv);
   const issueCode = resolveIssueCode(issueArg);
-  if (!issueCode) usage('Usage: linear-cli comments <ISSUE_CODE|FULL_URL> [-m "comment"] [-f <file.md>] [-a <file>...] (or run inside issue directory)');
+  if (!issueCode) usage('Usage: linear-cli comments <ISSUE_CODE|FULL_URL> [-m "comment"] [-f <file.md>] [-a <file>...] [-r <COMMENT_ID>] (or run inside issue directory)');
 
   // Comment body: prefer the -f file, fall back to -m. Local file links in the body are
   // resolved against the -f file's folder (or cwd for -m); -a paths against cwd.
@@ -91,14 +95,16 @@ async function cmdComments(token, argv) {
   if (body == null && addBody) body = addBody;
   if (body == null && attach.length) body = '';
 
+  if (replyTo != null && body == null) usage('Usage: linear-cli comments [ISSUE] -r <COMMENT_ID> -m "reply" (a reply needs -m, -f or -a)');
   if (body != null) {
-    await core.addComment(token, issueCode, { body, baseDir, attachBaseDir: process.cwd(), attach });
+    await core.addComment(token, issueCode, { body, baseDir, attachBaseDir: process.cwd(), attach, replyTo });
   }
 
   const { issue, index } = await core.syncIssue(token, issueCode);
-  for (const c of issue.comments?.nodes || []) {
-    console.log(`[${c.createdAt}] ${c.user?.name || 'Unknown'}:`);
-    console.log(rewriteMarkdownAttachments(c.body || '', index));
+  for (const { comment: c, reply } of core.threadComments(issue.comments?.nodes)) {
+    const text = rewriteMarkdownAttachments(c.body || '', index);
+    console.log(`${reply ? '  ↳ ' : ''}[${c.createdAt}] ${c.user?.name || 'Unknown'} (${core.shortCommentId(c.id)}):`);
+    console.log(reply ? text.replace(/^/gm, '    ') : text);
     console.log('---');
   }
 }
@@ -365,8 +371,9 @@ Local workflow:
   me                                  Show your user info
   take [-me] <ISSUE>                  Pull an issue locally (optionally assign yourself)
   sync [ISSUE]                        Refresh a locally stored issue
-  comments [ISSUE] [-m "text"] [-f file.md] [-a file...]
-                                      Read or post comments (local files are uploaded)
+  comments [ISSUE] [-m "text"] [-f file.md] [-a file...] [-r COMMENT_ID]
+                                      Read or post comments (local files are uploaded);
+                                      -r replies in that comment's thread
   list                                Browse local issues (fzf if available)
 
 Find & triage:

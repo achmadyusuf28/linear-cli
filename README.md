@@ -35,7 +35,7 @@ linear-cli login --env
 |---------|-------------|
 | `linear-cli me` | Show your user info |
 | `linear-cli take [-me] ISSUE` | Pull an issue locally, optionally assign yourself |
-| `linear-cli comments [ISSUE] [-m "text"] [-f file.md] [-a file...]` | Read/post comments on an issue |
+| `linear-cli comments [ISSUE] [-m "text"] [-f file.md] [-a file...] [-r COMMENT_ID]` | Read/post comments on an issue. `-r` replies in an existing comment's thread |
 | `linear-cli sync [ISSUE]` | Refresh a locally stored issue |
 | `linear-cli list` | Browse local issues (uses fzf if available) |
 
@@ -65,6 +65,25 @@ Using the `linear` wrapper, `take`, `create --take`, and picking from `mine`/`se
 # issue.md contains ![repro](./screens/repro.png) and [logs](../server.log)
 linear create --team TEC "Checkout crashes on submit" -f issue.md -a trace.har -me --take
 linear comments -m "Fixed, see ![after](./after.png)"
+```
+
+### Replying to a comment
+
+`comments` prints each comment with a short id, and replies are shown indented under their thread:
+
+```
+[2026-02-01T10:00:00Z] Dana Lee (1a2b3c4d):
+Can you check this on Safari?
+---
+  ↳ [2026-02-01T11:00:00Z] Yusuf A (5e6f7a8b):
+    Will do.
+---
+```
+
+Reply with `-r` and that id (or a full comment id, or a Linear comment link ending in `#comment-…`). Replying to a reply posts in the same thread, since Linear threads are one level deep. `-m`, `-f` and `-a` work the same as for a new comment.
+
+```bash
+linear comments TEC-123 -r 1a2b3c4d -m "Fixed on Safari too"
 ```
 
 Example `tree` output:
@@ -119,7 +138,7 @@ If `linear-mcp` isn't on the client's PATH, use `"command": "node", "args": ["/p
 | `linear_assign_issue` | `assign` (`me`, `none`, or a name/email) |
 | `linear_list_estimates` / `linear_set_estimate` | `estimate` (`null` or `"none"` clears it) |
 | `linear_create_issue` | `create` (local files in the description are uploaded; `take: true` pulls it locally) |
-| `linear_add_comment` | `comments -m` (local files are uploaded) |
+| `linear_add_comment` | `comments -m` (local files are uploaded; `reply_to` replies to a comment, like `-r`) |
 | `linear_take_issue` / `linear_sync_issue` | `take` / `sync` |
 | `linear_list_local_issues` | `list` |
 

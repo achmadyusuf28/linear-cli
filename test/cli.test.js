@@ -124,6 +124,10 @@ function resolve(query, v) {
   if (/commentCreate/.test(query)) {
     const i = Object.values(db).find(x => x.id === v.input.issueId);
     const c = { id: `new${i.comments.nodes.length}`, body: v.input.body, createdAt: '2026-02-01T00:00:00Z', user: { id: 'u1', name: 'Yusuf A' } };
+    if (v.input.parentId) {
+      if (!i.comments.nodes.some(x => x.id === v.input.parentId && !x.parent)) throw new Error('parentId must be a top-level comment of this issue');
+      c.parent = { id: v.input.parentId };
+    }
     i.comments.nodes.push(c);
     return { commentCreate: { success: true, comment: { id: c.id } } };
   }
@@ -506,6 +510,39 @@ test('comments -m with a local image and -a uploads both', async () => {
   assert.match(db['TEC-4'].comments.nodes.slice(-1)[0].body, /^!\[a\.png\]\(https:\/\/uploads/);
 });
 
+test('comments -r replies in a thread, by id prefix, URL or via a reply', async () => {
+  db['TEC-6'] = makeIssue(6, 'Threaded');
+  db['TEC-6'].comments.nodes = [
+    { id: 'aaaa1111-0000', body: 'first question', createdAt: '2026-01-01T00:00:00Z', user: { id: 'u2', name: 'Dana Lee' } },
+    { id: 'aaaa2222-0000', body: 'second topic', createdAt: '2026-01-02T00:00:00Z', user: { id: 'u2', name: 'Dana Lee' } },
+  ];
+  const nodes = db['TEC-6'].comments.nodes;
+  const r = await run(['comments', 'TEC-6', '-r', 'aaaa1111', '-m', 'answer one']);
+  assert.strictEqual(r.code, 0, r.stderr);
+  assert.deepStrictEqual(nodes.slice(-1)[0].parent, { id: 'aaaa1111-0000' });
+  // Reply shows indented right under its parent, before the later top-level comment
+  assert.match(r.stdout, /Dana Lee \(aaaa1111\):\nfirst question\n---\n  ↳ \[[^\]]+\] Yusuf A \(new2\):\n    answer one\n---\n\[[^\]]+\] Dana Lee \(aaaa2222\)/);
+  const root = path.join(home, 'linear-issues');
+  const day = fs.readdirSync(root).find(d => fs.existsSync(path.join(root, d, 'TEC-6')));
+  const md = fs.readFileSync(path.join(root, day, 'TEC-6', 'comments.md'), 'utf8');
+  assert.match(md, /- Dana Lee at [^\n]+ \[aaaa1111\]:\n\nfirst question\n\n  - ↳ Yusuf A at [^\n]+ \[new2\]:\n\n    answer one/);
+  // Replying to a reply goes to the thread's top-level comment
+  assert.strictEqual((await run(['comments', 'TEC-6', '--reply', 'new2', '-m', 'follow up'])).code, 0);
+  assert.deepStrictEqual(nodes.slice(-1)[0].parent, { id: 'aaaa1111-0000' });
+  // Linear comment URL
+  assert.strictEqual((await run(['comments', 'TEC-6', '-r', 'https://linear.app/acme/issue/TEC-6/threaded#comment-aaaa2222', '-m', 'via url'])).code, 0);
+  assert.deepStrictEqual(nodes.slice(-1)[0].parent, { id: 'aaaa2222-0000' });
+  const count = nodes.length;
+  const amb = await run(['comments', 'TEC-6', '-r', 'aaaa', '-m', 'x']);
+  assert.notStrictEqual(amb.code, 0);
+  assert.match(amb.stderr, /matches 2 comments/);
+  const missing = await run(['comments', 'TEC-6', '-r', 'zzzz', '-m', 'x']);
+  assert.match(missing.stderr, /Comment "zzzz" not found on TEC-6/);
+  const noBody = await run(['comments', 'TEC-6', '-r', 'aaaa1111']);
+  assert.notStrictEqual(noBody.code, 0);
+  assert.strictEqual(nodes.length, count, 'nothing posted on errors');
+});
+
 test('mcp: initialize, tools/list, ping, unknown method', async () => {
   const m = mcpSession({ viaCli: true });
   const init = await m.request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '1' } });
@@ -591,6 +628,16 @@ test('mcp: write tools change state, assignee, comments and create issues', asyn
   assert.strictEqual(puts.length, 2);
   assert.match(db['TEC-3'].comments.nodes.slice(-1)[0].body, /^from mcp !\[s\]\(https:\/\/uploads\.linear\.app\/.+\)\n\n\[x\.log\]\(https:\/\/uploads/);
   assert.match(c.text, /Uploaded shot\.png|Uploaded .*shot\.png/, 'upload notes returned to the client');
+  const g = await m.call('linear_get_issue', { issue: 'TEC-3' });
+  const top = g.json.comments.slice(-1)[0];
+  assert.strictEqual(top.parentId, null);
+  const rep = await m.call('linear_add_comment', { issue: 'TEC-3', body: 'mcp reply', reply_to: top.id });
+  assert.ok(!rep.isError, rep.text);
+  assert.strictEqual(rep.json.parentId, top.id);
+  assert.strictEqual((await m.call('linear_get_issue', { issue: 'TEC-3' })).json.comments.slice(-1)[0].parentId, top.id);
+  const badReply = await m.call('linear_add_comment', { issue: 'TEC-3', body: 'x', reply_to: 'nope' });
+  assert.strictEqual(badReply.isError, true);
+  assert.match(badReply.text, /not found on TEC-3/);
   const created = await m.call('linear_create_issue', { title: 'Made by MCP', description: 'hi', assign_to_me: true, take: true });
   assert.ok(!created.isError, created.text);
   assert.match(created.json.identifier, /^TEC-\d+$/);
