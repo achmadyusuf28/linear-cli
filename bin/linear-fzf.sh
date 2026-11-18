@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${HOME}/linear-issues"
+ROOT="${LINEAR_ISSUES_DIR:-${HOME}/linear-issues}"
+ROOT="${ROOT/#\~/$HOME}"
 
 if ! command -v fzf >/dev/null 2>&1; then
   echo "fzf is required (install and ensure it's on PATH)." >&2
