@@ -146,7 +146,7 @@ Issue arguments are a code (`TEC-123`) or a Linear URL. Relative file paths in `
 
 ## Folder structure
 
-Issues are stored under `~/linear-issues/<YYYY-MM-DD>/<ISSUE_CODE>/`:
+Issues are stored under `~/linear-issues/<YYYY-MM-DD>/<ISSUE_CODE>/`. Set `LINEAR_ISSUES_DIR` to use another root folder (a leading `~/` is expanded); the CLI, the MCP server and `linear-fzf.sh` all read it:
 
 ```
 ~/linear-issues/

@@ -210,7 +210,7 @@ function testEnv() {
 
 function run(args, opts = {}) {
   return new Promise((resolve) => {
-    execFile(process.execPath, [CLI, ...args], { cwd: opts.cwd || home, env: testEnv() },
+    execFile(process.execPath, [CLI, ...args], { cwd: opts.cwd || home, env: { ...testEnv(), ...(opts.env || {}) } },
       (err, stdout, stderr) => resolve({ code: err ? err.code : 0, stdout, stderr }));
   });
 }
@@ -294,6 +294,19 @@ test('take writes full metadata including hierarchy', async () => {
   const desc = fs.readFileSync(path.join(folder, 'description.md'), 'utf8');
   assert.match(desc, /Parent: TEC-1 Epic: checkout/);
   assert.match(desc, /Project: Checkout v2 \/ Beta/);
+});
+
+test('LINEAR_ISSUES_DIR moves where issues are stored', async () => {
+  const env = { LINEAR_ISSUES_DIR: path.join(home, 'custom-root') };
+  const r = await run(['take', 'TEC-2'], { env });
+  assert.equal(r.code, 0, r.stderr);
+  const folder = r.stdout.match(/^Prepared (.+)$/m)[1];
+  assert.ok(folder.startsWith(path.join(home, 'custom-root') + path.sep), folder);
+  assert.ok(fs.existsSync(path.join(folder, 'metadata.json')));
+  const again = await run(['take', 'TEC-2'], { env });
+  assert.match(again.stdout, new RegExp(`^Already prepared at ${folder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
+  const tilde = await run(['list'], { env: { LINEAR_ISSUES_DIR: '~/custom-root' } });
+  assert.match(tilde.stdout, /TEC-2/);
 });
 
 test('sync keeps creator/assignee in metadata (regression)', async () => {
